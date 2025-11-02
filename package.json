@@ -1,0 +1,12 @@
+{
+  "name": "zalo-bot-206",
+  "version": "1.0.1",
+  "description": "Zalo OA webhook (Render-ready) with TXT + HTML verify routes",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.4.5"
+  }
+}
