@@ -1,33 +1,28 @@
-// === OA 206 Zalo Bot Server ===
-// Cấu hình hoàn chỉnh để xác thực domain + nhận Webhook từ Zalo OA
+// === OA 206 Zalo Bot Server (Final Verified Version) ===
 
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 const app = express();
 
-// ✅ Cho phép phục vụ file tĩnh (để Zalo có thể xác minh file HTML)
-app.use(express.static(__dirname, {
-  extensions: ['html'],
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('.html')) {
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    }
-  }
-}));
+// ✅ Bật phục vụ file tĩnh (đảm bảo Zalo có thể đọc file HTML xác minh)
+app.use(express.static(__dirname));
 
-// ✅ Endpoint phục vụ file xác thực domain
+// ✅ Endpoint phục vụ file xác minh Zalo với MIME chính xác
 app.get('/zalo-verifier-CyU78lIr33n_e8ePfgaWBqVNbN6hg4OgDZC.html', (req, res) => {
-  res.sendFile(path.join(__dirname, 'zalo-verifier-CyU78lIr33n_e8ePfgaWBqVNbN6hg4OgDZC.html'));
+  const filePath = path.join(__dirname, 'zalo-verifier-CyU78lIr33n_e8ePfgaWBqVNbN6hg4OgDZC.html');
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.send(fs.readFileSync(filePath, 'utf8'));
 });
 
-// ✅ Trang test hoạt động chính
+// ✅ Trang kiểm tra hoạt động
 app.get('/', (req, res) => {
-  res.send('💧 OA 206 bot đang hoạt động (đã bật phục vụ file xác minh Zalo)');
+  res.send('💧 OA 206 bot đang hoạt động (đã tối ưu xác thực Zalo)');
 });
 
-// ✅ Webhook endpoint - Zalo OA sẽ gửi sự kiện về đây
+// ✅ Webhook endpoint (Zalo OA gửi sự kiện về đây)
 app.post('/webhook', express.json(), (req, res) => {
-  console.log('Webhook received:', req.body);
+  console.log('Webhook event:', req.body);
   res.sendStatus(200);
 });
 
@@ -35,5 +30,5 @@ app.post('/webhook', express.json(), (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Bot đang chạy tại cổng ${PORT}`);
-  console.log(`🌐 Kiểm tra xác minh tại: https://zalo-bot-206.onrender.com/zalo-verifier-CyU78lIr33n_e8ePfgaWBqVNbN6hg4OgDZC.html`);
+  console.log(`✅ Kiểm tra file xác minh tại: https://zalo-bot-206.onrender.com/zalo-verifier-CyU78lIr33n_e8ePfgaWBqVNbN6hg4OgDZC.html`);
 });
