@@ -4,6 +4,9 @@ const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
+// Cho phép Express phục vụ file tĩnh trong thư mục gốc
+const path = require('path');
+app.use(express.static(path.join(__dirname, '.')));
 app.use(bodyParser.json());
 
 // ✅ Kiểm tra bot
