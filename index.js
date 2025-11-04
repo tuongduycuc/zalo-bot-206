@@ -1,29 +1,36 @@
-require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
+const axios = require('axios');
+require('dotenv').config();
 
 const app = express();
-app.use(bodyParser.json({ limit: '2mb' }));
+app.use(bodyParser.json());
 
-// TXT verify
-app.get('/zalodomainverify.txt', (req, res) => {
-  res.type('text/plain').send('zalo-domain-verification=' + (process.env.VERIFY_TOKEN || ''));
+// ✅ Kiểm tra bot
+app.get('/', (req, res) => res.send('💧 OA 206 bot đang hoạt động!'));
+
+// ✅ Webhook nhận tin nhắn từ Zalo
+app.post('/webhook', async (req, res) => {
+  const body = req.body;
+  console.log('📩 Nhận dữ liệu:', JSON.stringify(body, null, 2));
+
+  // Nếu là tin nhắn người dùng gửi đến OA
+  if (body.event_name === 'user_send_text') {
+    const text = body.message.text;
+    const userId = body.sender.id;
+    console.log(`Tin từ ${userId}: ${text}`);
+
+    // Gửi lại phản hồi
+    await axios.post('https://openapi.zalo.me/v3.0/oa/message/callback', {
+      recipient: { user_id: userId },
+      message: { text: `Cảm ơn bạn, OA 206 đã nhận: ${text}` }
+    }, {
+      headers: { access_token: process.env.ACCESS_TOKEN }
+    });
+  }
+
+  res.status(200).send('OK');
 });
-
-// HTML verify (exact filename from Zalo)
-app.get('/CyU78lIr33n_e8ePfgaWBqVNbN6hg40gDZC.html', (req, res) => {
-  res.type('text/html').send('zalo-domain-verification=' + (process.env.VERIFY_TOKEN || ''));
-});
-
-// Webhook endpoint
-app.post('/webhook', (req, res) => {
-  console.log('Webhook hit:', JSON.stringify(req.body));
-  res.sendStatus(200);
-});
-
-app.get('/', (req, res) => res.send('Zalo bot 206 is running'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('Server listening on ' + PORT);
-});
+app.listen(PORT, () => console.log(`🚀 Bot đang chạy tại cổng ${PORT}`));
