@@ -7,7 +7,7 @@ import fs from "fs";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const ACCESS_TOKEN = process.env.ZALO_OA_ACCESS_TOKEN || "ZALO_OA_ACCESS_TOKEN_CUA_BAN";
+const ACCESS_TOKEN = process.env.ZALO_OA_ACCESS_TOKEN || "XzfP9dlmHLU2rLegSVvCMOBLLYfdhYaYbTvjDntuS020dXLf3U9F7PAx5HGKxNbYffC1SXZuM6MOcqvxFhu3POBVJdC7fmHpjk1002wz81kFm45h5QO5MUtH4qyHZamudUHMAM2VEYRulbCHU-Wz7DMLV1Glu0mNXQfo6IQDBGUNm4iP2x0X3PBaTWGUl0y1eyPG0bwuBXRlmMivTeCT8jluK0LPZ4ODegmz4opiNXAYZXyRESHZ9hZc22mcn74cjO4JAZRcL1ISW3rZRzXQTlQiFbrKwKPpte4lHNtODYpFXauwRl0c4vRKSHDhYpSdoQejKs7YRK_VW7ffODutUDkFTaHsnJGrzU5p5tEcFGoLpYOVQSiIBqHuvaLL";
 let GROUP_ID = process.env.GROUP_ID || "";
 
 const TASK_FILE = "./tasks.json";
