@@ -95,3 +95,19 @@ setInterval(async () => {
 
 app.get("/", (req, res) => res.send("💧 Zalo Task Bot 206 đang chạy!"));
 app.listen(PORT, () => console.log(`🚀 Server tại cổng ${PORT}`));
+import fs from "fs";
+
+let GROUP_ID = "";
+
+app.post("/webhook", (req, res) => {
+  console.log("📩 Dữ liệu nhận từ Zalo:", JSON.stringify(req.body, null, 2));
+  res.status(200).send("OK");
+
+  // ✅ Bắt group_id và lưu lại khi có tin nhắn mới
+  const groupId = req.body?.recipient?.group_id || req.body?.message?.conversation_id;
+  if (groupId && !GROUP_ID) {
+    GROUP_ID = groupId;
+    fs.writeFileSync("group.json", JSON.stringify({ group_id: groupId }, null, 2));
+    console.log("🔐 Đã lưu GROUP_ID:", groupId);
+  }
+});
