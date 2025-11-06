@@ -1,26 +1,21 @@
-// index.js — Zalo Task Bot cho nhóm
-// Yêu cầu: npm i express body-parser axios
-const express = require("express");
-const bodyParser = require("body-parser");
-const axios = require("axios");
-const fs = require("fs");
+// index.js - Dạng ES Module (Render hỗ trợ tốt nhất)
+import express from "express";
+import bodyParser from "body-parser";
+import axios from "axios";
+import fs from "fs";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ====== CẤU HÌNH CẦN ĐIỀN ======
-const ACCESS_TOKEN = process.env.ZALO_OA_ACCESS_TOKEN || "XzfP9dlmHLU2rLegSVvCMOBLLYfdhYaYbTvjDntuS020dXLf3U9F7PAx5HGKxNbYffC1SXZuM6MOcqvxFhu3POBVJdC7fmHpjk1002wz81kFm45h5QO5MUtH4qyHZamudUHMAM2VEYRulbCHU-Wz7DMLV1Glu0mNXQfo6IQDBGUNm4iP2x0X3PBaTWGUl0y1eyPG0bwuBXRlmMivTeCT8jluK0LPZ4ODegmz4opiNXAYZXyRESHZ9hZc22mcn74cjO4JAZRcL1ISW3rZRzXQTlQiFbrKwKPpte4lHNtODYpFXauwRl0c4vRKSHDhYpSdoQejKs7YRK_VW7ffODutUDkFTaHsnJGrzU5p5tEcFGoLpYOVQSiIBqHuvaLL"; // <- thay token OA thật
-// GROUP_ID sẽ được tự động bắt và lưu khi bot nhận tin nhắn trong nhóm lần đầu
+const ACCESS_TOKEN = process.env.ZALO_OA_ACCESS_TOKEN || "ZALO_OA_ACCESS_TOKEN_CUA_BAN";
 let GROUP_ID = process.env.GROUP_ID || "";
 
-// ====== FILE LƯU TẠM ======
-const TASK_FILE  = "./tasks.json";   // lưu nhiệm vụ trong ngày
-const GROUP_FILE = "./group.json";   // lưu group_id nhận được
+const TASK_FILE = "./tasks.json";
+const GROUP_FILE = "./group.json";
 
-// ====== HỖ TRỢ ======
 app.use(bodyParser.json());
 
-// đọc / ghi tasks an toàn
+// ====== HÀM HỖ TRỢ ======
 function loadTasks() {
   try {
     if (!fs.existsSync(TASK_FILE)) return [];
@@ -33,7 +28,6 @@ function saveTasks(tasks) {
   fs.writeFileSync(TASK_FILE, JSON.stringify(tasks, null, 2));
 }
 
-// lưu / nạp GROUP_ID
 function loadGroupId() {
   try {
     if (!fs.existsSync(GROUP_FILE)) return "";
@@ -49,38 +43,18 @@ function saveGroupId(id) {
   console.log("🔐 Đã lưu GROUP_ID:", id);
 }
 
-// nạp nếu có sẵn
 if (!GROUP_ID) GROUP_ID = loadGroupId();
 
-// Thời gian VN
-function getVNDate() {
-  return new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" });
-}
-function getVNParts() {
-  const now = new Date();
-  const fmt = new Intl.DateTimeFormat("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour: "2-digit", minute: "2-digit", hour12: false, year: "numeric", month: "2-digit", day: "2-digit" });
-  const parts = Object.fromEntries(fmt.formatToParts(now).map(p => [p.type, p.value]));
-  return {
-    Y: parts.year,
-    M: parts.month,
-    D: parts.day,
-    h: parseInt(parts.hour, 10),
-    m: parseInt(parts.minute, 10),
-    dateStr: `${parts.day}/${parts.month}/${parts.year}`
-  };
-}
-
-// Gửi text qua OA API (mặc định: gửi vào nhóm qua group_id)
 async function sendTextToGroup(text) {
   if (!GROUP_ID) {
-    console.log("⚠️ Chưa có GROUP_ID để gửi báo cáo.");
+    console.log("⚠️ Chưa có GROUP_ID để gửi tin nhắn.");
     return;
   }
   try {
     await axios.post(
       "https://openapi.zalo.me/v3.0/oa/message/callback",
       {
-        recipient: { group_id: GROUP_ID }, // gửi vào nhóm
+        recipient: { group_id: GROUP_ID },
         message: { text }
       },
       {
@@ -96,122 +70,69 @@ async function sendTextToGroup(text) {
   }
 }
 
-// Regex nhận diện hoàn thành
 const DONE_REGEX = /(đã xong|da xong|ok\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
 
-// ====== WEBHOOK: Zalo gọi vào đây ======
+// ====== WEBHOOK ======
 app.post("/webhook", async (req, res) => {
   const data = req.body;
-  console.log("📩 Webhook payload:", JSON.stringify(data, null, 2));
-  res.status(200).send("OK"); // luôn 200 cho Zalo
+  res.status(200).send("OK");
 
-  // 1) Tự động bắt GROUP_ID từ payload lần đầu
   const detectedGroupId =
     data?.recipient?.group_id ||
     data?.message?.conversation_id ||
     data?.conversation?.id ||
     "";
 
-  if (detectedGroupId && !GROUP_ID) {
-    saveGroupId(detectedGroupId);
-  }
+  if (detectedGroupId && !GROUP_ID) saveGroupId(detectedGroupId);
 
-  // 2) Xử lý tin nhắn văn bản của người dùng
   if (data.event_name === "user_send_text") {
     const sender = data.sender?.id || "unknown";
-    const text   = (data.message?.text || "").trim();
-    const nowStr = getVNDate();
+    const text = (data.message?.text || "").trim();
 
-    // Lệnh test nhanh: /groupid
     if (/^\/groupid$/i.test(text)) {
-      if (GROUP_ID) {
-        await sendTextToGroup(`GROUP_ID hiện tại: ${GROUP_ID}`);
-      } else {
-        await sendTextToGroup(`Chưa ghi nhận GROUP_ID. Hãy gửi 1 tin bất kỳ trong nhóm để bot tự lưu.`);
-      }
+      await sendTextToGroup(GROUP_ID ? `GROUP_ID hiện tại: ${GROUP_ID}` : "Chưa có GROUP_ID.");
       return;
     }
 
     let tasks = loadTasks();
 
-    // Nếu là tin nhắn xác nhận đã hoàn thành
     if (DONE_REGEX.test(text)) {
-      // đánh dấu công việc CHƯA hoàn thành gần nhất của người này
       for (let i = tasks.length - 1; i >= 0; i--) {
         if (tasks[i].sender === sender && !tasks[i].done) {
           tasks[i].done = true;
-          tasks[i].doneAt = nowStr;
           break;
         }
       }
       saveTasks(tasks);
-      console.log(`✅ Đánh dấu hoàn thành cho ${sender}`);
       return;
     }
 
-    // Ngược lại: thêm nhiệm vụ mới
-    tasks.push({
-      sender,
-      message: text,
-      time: nowStr,
-      done: false
-    });
+    tasks.push({ sender, message: text, done: false });
     saveTasks(tasks);
-    console.log(`📋 Thêm nhiệm vụ: (${sender}) → ${text}`);
   }
 });
 
-// (GET) Kiểm tra nhanh webhook
-app.get("/webhook", (req, res) => {
-  res.send("Webhook Zalo đang hoạt động ✅");
-});
-
-// Debug: xem tasks hiện tại
-app.get("/tasks", (req, res) => {
-  res.json(loadTasks());
-});
-
-// Debug: xoá tasks (reset ngày)
-app.post("/tasks/reset", (req, res) => {
-  saveTasks([]);
-  res.send("Đã reset danh sách nhiệm vụ.");
-});
-
-// Trang chủ
 app.get("/", (req, res) => {
-  res.send(`<h2>💧 Zalo Task Bot đang chạy!</h2>
-  <ul>
-    <li>Webhook: <code>POST /webhook</code></li>
-    <li>Xem nhiệm vụ: <a href="/tasks">/tasks</a></li>
-  </ul>`);
+  res.send("<h2>💧 Zalo Task Bot đang chạy!</h2>");
 });
 
-// ====== LỊCH GỬI BÁO CÁO 17:00 HÀNG NGÀY ======
-let lastReportDate = ""; // để tránh gửi trùng trong cùng ngày
+// ====== BÁO CÁO 17:00 ======
 setInterval(async () => {
-  const { Y, M, D, h, m, dateStr } = getVNParts();
-  if (h === 17 && m === 0 && lastReportDate !== `${Y}-${M}-${D}`) {
+  const now = new Date();
+  const h = now.getHours() + 7 > 23 ? now.getHours() - 17 : now.getHours() + 7; // giờ VN
+  const m = now.getMinutes();
+  if (h === 17 && m === 0) {
     const tasks = loadTasks();
     const done = tasks.filter(t => t.done);
     const pending = tasks.filter(t => !t.done);
-
-    let msg = `📅 Báo cáo ngày ${dateStr}\n\n`;
-    msg += "✅ ĐÃ HOÀN THÀNH:\n";
-    msg += done.length ? done.map(t => `• ${t.message}`).join("\n") : "• Không có\n";
-    msg += "\n⚠️ CHƯA HOÀN THÀNH:\n";
-    msg += pending.length ? pending.map(t => `• ${t.message}`).join("\n") : "• Không có";
-
+    let msg = `📅 Báo cáo ngày ${now.toLocaleDateString("vi-VN")}\n\n`;
+    msg += "✅ ĐÃ HOÀN THÀNH:\n" + (done.length ? done.map(t => `• ${t.message}`).join("\n") : "• Không có") + "\n\n";
+    msg += "⚠️ CHƯA HOÀN THÀNH:\n" + (pending.length ? pending.map(t => `• ${t.message}`).join("\n") : "• Không có");
     await sendTextToGroup(msg);
-
-    // Reset danh sách sau khi báo cáo
     saveTasks([]);
-    lastReportDate = `${Y}-${M}-${D}`;
-    console.log("🕔 Đã gửi báo cáo 17:00 & reset danh sách.");
   }
-}, 15 * 1000); // kiểm tra mỗi 15 giây (nhẹ nhàng hơn mỗi phút)
+}, 60 * 1000);
 
-// ====== KHỞI ĐỘNG ======
 app.listen(PORT, () => {
-  console.log(`🚀 Server chạy cổng ${PORT}`);
-  console.log(`ℹ️ Nhớ đặt ZALO_OA_ACCESS_TOKEN trong Render (Environment)`);
+  console.log(`🚀 Bot chạy tại cổng ${PORT}`);
 });
