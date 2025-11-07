@@ -8,7 +8,7 @@ import fs from 'fs';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- ENV (hỗ trợ cả tên cũ lẫn mới) ----
+// ---- ENV (hỗ trợ cả 2 tên biến) ----
 const ACCESS_TOKEN =
   process.env.ZALO_OA_ACCESS_TOKEN ||
   process.env.ACCESS_TOKEN || '';
@@ -45,23 +45,32 @@ function saveGroupId(id) {
 }
 if (!GROUP_ID) GROUP_ID = loadGroupId();
 
+// ===== Gửi TEXT vào NHÓM GMF (endpoint đúng) =====
 async function sendTextToGroup(text) {
   if (!GROUP_ID) return console.log('⚠️ Chưa có GROUP_ID.');
   if (!ACCESS_TOKEN) return console.log('⚠️ Thiếu ACCESS_TOKEN.');
+
   try {
     const res = await axios.post(
-      'https://openapi.zalo.me/v3.0/oa/message/callback',
-      { recipient: { group_id: GROUP_ID }, message: { text } },
-      { headers: { access_token: ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+      'https://openapi.zalo.me/v3.0/oa/group/message',
+      { group_id: GROUP_ID, message: { text: String(text) } },
+      {
+        headers: {
+          access_token: ACCESS_TOKEN,
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        validateStatus: () => true
+      }
     );
-    console.log('📨 Zalo response (callback):', res.data);
-    if (res.data && (res.data.error === 0 || res.data.message === 'Success')) {
+    console.log('📨 Zalo response (group/message):', res.status, res.data);
+    if (res.data?.error === 0 || res.data?.message === 'Success') {
       console.log('✅ Đã gửi vào nhóm.');
     } else {
       console.log('⚠️ Gửi không thành công:', res.data);
     }
-  } catch (err) {
-    console.error('❌ Lỗi gửi (callback):', err.response?.data || err.message);
+  } catch (e) {
+    console.error('❌ Lỗi gửi:', e.response?.data || e.message);
   }
 }
 
@@ -101,10 +110,7 @@ app.post('/webhook', async (req, res) => {
 
     if (DONE_REGEX.test(text)) {
       for (let i = tasks.length - 1; i >= 0; i--) {
-        if (tasks[i].sender === sender && !tasks[i].done) {
-          tasks[i].done = true;
-          break;
-        }
+        if (tasks[i].sender === sender && !tasks[i].done) { tasks[i].done = true; break; }
       }
       saveTasks(tasks);
       return;
@@ -144,7 +150,7 @@ app.get('/set-group', (req, res) => {
   res.send('OK, GROUP_ID=' + id);
 });
 
-// Gửi nhanh qua callback API: /send?text=...
+// Gửi nhanh 1 tin vào nhóm: /send?text=...
 app.get('/send', async (req, res) => {
   const text = String(req.query.text || '').trim();
   if (!text) return res.status(400).send('Thiếu ?text');
@@ -152,17 +158,23 @@ app.get('/send', async (req, res) => {
   res.send('Đã gọi gửi: ' + text);
 });
 
-// Thử endpoint group riêng (một số OA yêu cầu): /send2?text=...
+// (tuỳ chọn) endpoint test phụ — vẫn dùng group/message
 app.get('/send2', async (req, res) => {
-  if (!GROUP_ID) return res.status(400).send('Chưa có GROUP_ID');
-  if (!ACCESS_TOKEN) return res.status(400).send('Thiếu ACCESS_TOKEN');
+  const text = String(req.query.text || 'test').trim();
   try {
     const r = await axios.post(
       'https://openapi.zalo.me/v3.0/oa/group/message',
-      { group_id: GROUP_ID, message: { text: String(req.query.text || 'test') } },
-      { headers: { access_token: ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+      { group_id: GROUP_ID, message: { text } },
+      {
+        headers: {
+          access_token: ACCESS_TOKEN,
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        validateStatus: () => true
+      }
     );
-    console.log('📨 Zalo response (group/message):', r.data);
+    console.log('📨 Zalo response (send2):', r.status, r.data);
     res.json(r.data);
   } catch (e) {
     console.error('❌ send2 error:', e.response?.data || e.message);
