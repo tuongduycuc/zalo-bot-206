@@ -18,7 +18,7 @@ const TASK_FILE  = './tasks.json';
 const GROUP_FILE = './group.json';
 const LAST_FILE  = './public/last_webhook.json';
 
-// OA API v3 base (ĐÚNG)
+// OA API v3 base (đúng)
 const API_BASE = 'https://openapi.zalo.me/v3.0';
 
 app.use(bodyParser.json());
@@ -56,7 +56,8 @@ async function sendTextToGroup(text){
       {
         headers: {
           'Content-Type': 'application/json',
-          access_token: ACCESS_TOKEN, // V3 dùng header này
+          access_token: ACCESS_TOKEN,
+          Authorization: `Bearer ${ACCESS_TOKEN}`
         },
         validateStatus: () => true
       }
@@ -83,6 +84,7 @@ async function sendTextToUser(user_id, text){
         headers: {
           'Content-Type': 'application/json',
           access_token: ACCESS_TOKEN,
+          Authorization: `Bearer ${ACCESS_TOKEN}`
         },
         validateStatus: () => true
       }
@@ -177,7 +179,10 @@ app.get('/send2-user', async (req,res)=>{
 app.get('/token-check', async (req,res)=>{
   try{
     const r = await axios.get(`${API_BASE}/oa/getoa`, {
-      headers: { access_token: ACCESS_TOKEN },
+      headers: {
+        access_token: ACCESS_TOKEN,
+        Authorization: `Bearer ${ACCESS_TOKEN}`
+      },
       validateStatus: () => true
     });
     res.status(r.status).json(r.data);
