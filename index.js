@@ -5,6 +5,8 @@ import bodyParser from 'body-parser';
 import axios from 'axios';
 import fs from 'fs';
 
+axios.defaults.timeout = 10000; // ⏱️ chống treo gây 502
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -18,7 +20,6 @@ const TASK_FILE  = './tasks.json';
 const GROUP_FILE = './group.json';
 const LAST_FILE  = './public/last_webhook.json';
 
-// OA API v3 base cho gửi tin nhắn
 const API_V3 = 'https://openapi.zalo.me/v3.0';
 
 app.use(bodyParser.json());
@@ -44,8 +45,6 @@ if (!GROUP_ID) GROUP_ID = loadGroupId();
 const DONE_REGEX = /(đã xong|da xong|ok\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
 
 // ==== Senders (V3 đúng schema) ====
-
-// Gửi TEXT vào NHÓM GMF (V3: recipient.group_id)
 async function sendTextToGroup(text){
   if (!GROUP_ID) return console.log('⚠️ Chưa có GROUP_ID.');
   if (!ACCESS_TOKEN) return console.log('⚠️ Thiếu ACCESS_TOKEN.');
@@ -53,7 +52,7 @@ async function sendTextToGroup(text){
     const r = await axios.post(
       `${API_V3}/oa/group/message`,
       {
-        recipient: { group_id: GROUP_ID },       // ✅ V3 bắt buộc
+        recipient: { group_id: GROUP_ID },
         message:   { text: String(text) }
       },
       {
@@ -62,7 +61,8 @@ async function sendTextToGroup(text){
           access_token: ACCESS_TOKEN,
           Authorization: `Bearer ${ACCESS_TOKEN}`
         },
-        validateStatus: () => true
+        validateStatus: () => true,
+        timeout: 10000 // ⏱️
       }
     );
     console.log('📨 V3 group/message:', r.status, r.data);
@@ -76,14 +76,13 @@ async function sendTextToGroup(text){
   }
 }
 
-// Gửi 1–1 tới user đã quan tâm OA (V3: recipient.user_id)
 async function sendTextToUser(user_id, text){
   if (!ACCESS_TOKEN) return console.log('⚠️ Thiếu ACCESS_TOKEN.');
   try {
     const r = await axios.post(
       `${API_V3}/oa/message`,
       {
-        recipient: { user_id },                  // ✅ V3 bắt buộc
+        recipient: { user_id },
         message:   { text: String(text) }
       },
       {
@@ -92,7 +91,8 @@ async function sendTextToUser(user_id, text){
           access_token: ACCESS_TOKEN,
           Authorization: `Bearer ${ACCESS_TOKEN}`
         },
-        validateStatus: () => true
+        validateStatus: () => true,
+        timeout: 10000 // ⏱️
       }
     );
     console.log('📨 V3 oa/message:', r.status, r.data);
@@ -107,10 +107,8 @@ app.post('/webhook', async (req,res)=>{
   console.log('📩 Webhook:', JSON.stringify(data));
   res.status(200).send('OK');
 
-  // Lưu payload gần nhất
   try { fs.writeFileSync(LAST_FILE, JSON.stringify(data,null,2)); } catch {}
 
-  // Tự phát hiện group id
   const detectedGroupId =
     data?.recipient?.group_id ||
     data?.message?.conversation_id ||
@@ -118,7 +116,6 @@ app.post('/webhook', async (req,res)=>{
     data?.group_id || '';
   if (detectedGroupId && !GROUP_ID) saveGroupId(detectedGroupId);
 
-  // Lưu task / đánh dấu done
   const ev = data.event_name || '';
   if (ev === 'user_send_text' || ev === 'group.message') {
     const sender = data.sender?.id || 'unknown';
@@ -151,12 +148,14 @@ app.get('/', (req,res)=>{
 });
 app.get('/health', (req,res)=> res.json({ ok:true, group_id: !!GROUP_ID }));
 
+// Route tự test nội bộ (phân biệt app down hay call Zalo treo)
+app.get('/__selftest', (req,res)=> res.json({ up:true, t:Date.now() }));
+
 app.get('/debug/last', (req,res)=>{
   try { res.type('application/json').send(fs.readFileSync(LAST_FILE,'utf8')); }
   catch { res.status(404).send('Chưa có payload nào.'); }
 });
 
-// Đặt GROUP_ID thủ công: /set-group?id=...
 app.get('/set-group', (req,res)=>{
   const id = String(req.query.id || '').trim();
   if (!id) return res.status(400).send('Thiếu ?id');
@@ -164,7 +163,6 @@ app.get('/set-group', (req,res)=>{
   res.send('OK, GROUP_ID=' + id);
 });
 
-// Test gửi nhóm: /send?text=Ping
 app.get('/send', async (req,res)=>{
   const text = String(req.query.text || '').trim();
   if (!text) return res.status(400).send('Thiếu ?text');
@@ -172,7 +170,6 @@ app.get('/send', async (req,res)=>{
   res.send('Đã gọi gửi: ' + text);
 });
 
-// Test gửi 1–1: /send2-user?uid=...&text=...
 app.get('/send2-user', async (req,res)=>{
   const uid  = String(req.query.uid  || '').trim();
   const text = String(req.query.text || 'test').trim();
@@ -187,11 +184,9 @@ app.get('/token-check', async (req, res) => {
   if (!token) return res.status(400).json({ error: 'no_token', message: 'Thiếu ACCESS_TOKEN trong ENV' });
 
   const tries = [
-    // Header trước
     { url: 'https://openapi.zalo.me/v3.0/oa/getoa', hdr: true },
     { url: 'https://openapi.zalo.me/v2.0/oa/getoa', hdr: true },
     { url: 'https://openapi.zalo.me/oa/getoa',     hdr: true },
-    // Rồi đến query param
     { url: `https://openapi.zalo.me/v3.0/oa/getoa?access_token=${encodeURIComponent(token)}`, hdr: false },
     { url: `https://openapi.zalo.me/v2.0/oa/getoa?access_token=${encodeURIComponent(token)}`, hdr: false },
     { url: `https://openapi.zalo.me/oa/getoa?access_token=${encodeURIComponent(token)}`,     hdr: false },
@@ -205,12 +200,9 @@ app.get('/token-check', async (req, res) => {
           Authorization: `Bearer ${token}`
         } : undefined,
         validateStatus: () => true,
-        timeout: 8000
+        timeout: 10000 // ⏱️
       });
-
       console.log('🔎 token-check try:', t.url, r.status, r.data?.error);
-
-      // Nếu không còn 404 "empty api" → coi như đã chạm đúng API (trả info OA hoặc lỗi -216…)
       if (r.status !== 404 && !(r.data && r.data.error === 404)) {
         return res.status(r.status).json(r.data);
       }
@@ -218,11 +210,9 @@ app.get('/token-check', async (req, res) => {
       console.log('token-check error on', t.url, e.message);
     }
   }
-
-  // Nếu rớt hết
   return res.status(404).json({
     error: 404,
-    message: 'All variants returned 404 (empty/invalid api). Hãy kiểm tra lại deploy (clear cache), domain và token.'
+    message: 'All variants returned 404 (empty/invalid api). Hãy kiểm tra deploy (clear cache), domain và token.'
   });
 });
 
