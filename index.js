@@ -18,8 +18,8 @@ const TASK_FILE  = './tasks.json';
 const GROUP_FILE = './group.json';
 const LAST_FILE  = './public/last_webhook.json';
 
-// OA API v3 base (đúng)
-const API_BASE = 'https://openapi.zalo.me/v3.0';
+// OA API v3 base cho gửi tin
+const API_V3 = 'https://openapi.zalo.me/v3.0';
 
 app.use(bodyParser.json());
 
@@ -51,7 +51,7 @@ async function sendTextToGroup(text){
   if (!ACCESS_TOKEN) return console.log('⚠️ Thiếu ACCESS_TOKEN.');
   try {
     const r = await axios.post(
-      `${API_BASE}/oa/group/message`,
+      `${API_V3}/oa/group/message`,
       { group_id: GROUP_ID, message: { text: String(text) } },
       {
         headers: {
@@ -78,7 +78,7 @@ async function sendTextToUser(user_id, text){
   if (!ACCESS_TOKEN) return console.log('⚠️ Thiếu ACCESS_TOKEN.');
   try {
     const r = await axios.post(
-      `${API_BASE}/oa/message`,
+      `${API_V3}/oa/message`,
       { recipient: { user_id }, message: { text: String(text) } },
       {
         headers: {
@@ -175,18 +175,28 @@ app.get('/send2-user', async (req,res)=>{
   res.send('Đã gọi gửi 1–1.');
 });
 
-// Check token (trả info OA nếu token hợp lệ)
-app.get('/token-check', async (req,res)=>{
-  try{
-    const r = await axios.get(`${API_BASE}/oa/getoa`, {
+// ==== TOKEN CHECK: thử V3 trước, nếu 404 thì fallback sang V2 ====
+app.get('/token-check', async (req, res) => {
+  try {
+    // Thử V3
+    let r = await axios.get(`${API_V3}/oa/getoa`, {
       headers: {
         access_token: ACCESS_TOKEN,
         Authorization: `Bearer ${ACCESS_TOKEN}`
       },
       validateStatus: () => true
     });
+
+    // Nếu V3 không có (404/empty api) → fallback sang V2
+    if (r.status === 404 || (r.data && r.data.error === 404)) {
+      r = await axios.get('https://openapi.zalo.me/v2.0/oa/getoa', {
+        headers: { access_token: ACCESS_TOKEN },
+        validateStatus: () => true
+      });
+    }
+
     res.status(r.status).json(r.data);
-  }catch(e){
+  } catch (e) {
     res.status(500).send(e.response?.data || e.message);
   }
 });
