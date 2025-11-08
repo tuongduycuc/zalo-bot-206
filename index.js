@@ -43,16 +43,19 @@ if (!GROUP_ID) GROUP_ID = loadGroupId();
 
 const DONE_REGEX = /(đã xong|da xong|ok\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
 
-// ==== Senders (V3) ====
+// ==== Senders (V3 đúng schema) ====
 
-// Gửi TEXT vào NHÓM GMF
+// Gửi TEXT vào NHÓM GMF (V3: recipient.group_id)
 async function sendTextToGroup(text){
   if (!GROUP_ID) return console.log('⚠️ Chưa có GROUP_ID.');
   if (!ACCESS_TOKEN) return console.log('⚠️ Thiếu ACCESS_TOKEN.');
   try {
     const r = await axios.post(
       `${API_V3}/oa/group/message`,
-      { group_id: GROUP_ID, message: { text: String(text) } },
+      {
+        recipient: { group_id: GROUP_ID },       // ✅ V3 bắt buộc
+        message:   { text: String(text) }
+      },
       {
         headers: {
           'Content-Type': 'application/json',
@@ -73,13 +76,16 @@ async function sendTextToGroup(text){
   }
 }
 
-// Gửi 1–1 tới user đã quan tâm OA
+// Gửi 1–1 tới user đã quan tâm OA (V3: recipient.user_id)
 async function sendTextToUser(user_id, text){
   if (!ACCESS_TOKEN) return console.log('⚠️ Thiếu ACCESS_TOKEN.');
   try {
     const r = await axios.post(
       `${API_V3}/oa/message`,
-      { recipient: { user_id }, message: { text: String(text) } },
+      {
+        recipient: { user_id },                  // ✅ V3 bắt buộc
+        message:   { text: String(text) }
+      },
       {
         headers: {
           'Content-Type': 'application/json',
