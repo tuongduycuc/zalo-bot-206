@@ -5,7 +5,7 @@ import bodyParser from 'body-parser';
 import axios from 'axios';
 import fs from 'fs';
 
-axios.defaults.timeout = 10000; // ⏱️ chống treo gây 502
+axios.defaults.timeout = 10000; // chống treo gây 502
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,6 +15,7 @@ const ACCESS_TOKEN =
   process.env.ZALO_OA_ACCESS_TOKEN ||
   process.env.ACCESS_TOKEN || '';
 let GROUP_ID = process.env.GROUP_ID || '';
+const ADMIN_UIDS = (process.env.ADMIN_UIDS || '').split(',').map(s=>s.trim()).filter(Boolean);
 
 const TASK_FILE  = './tasks.json';
 const GROUP_FILE = './group.json';
@@ -24,7 +25,7 @@ const API_V3 = 'https://openapi.zalo.me/v3.0';
 
 app.use(bodyParser.json());
 
-// ==== Helpers ====
+// ==== Helpers (IO) ====
 function loadTasks() {
   try { return fs.existsSync(TASK_FILE) ? JSON.parse(fs.readFileSync(TASK_FILE,'utf8')) : []; }
   catch { return []; }
@@ -42,7 +43,43 @@ function saveGroupId(id){
 }
 if (!GROUP_ID) GROUP_ID = loadGroupId();
 
-const DONE_REGEX = /(đã xong|da xong|ok\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
+// ==== Helpers (time & format) ====
+const VN_TZ = 'Asia/Ho_Chi_Minh';
+const fmtDate = (d) => new Date(d).toLocaleString('vi-VN', { timeZone: VN_TZ });
+
+function parseDue(input){
+  // chấp nhận "dd/mm/yyyy hh:mm" hoặc "dd/mm hh:mm" (năm = năm hiện tại), hoặc chỉ "dd/mm"
+  if (!input) return null;
+  const s = input.trim();
+  // dd/mm/yyyy hh:mm
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})$/);
+  if (m) {
+    const [_, dd, mm, yyyy, hh, mi] = m.map(Number);
+    return new Date(Date.UTC(yyyy, mm-1, dd, hh-7, mi)).toISOString();
+  }
+  // dd/mm hh:mm (năm hiện tại)
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})$/);
+  if (m) {
+    const now = new Date();
+    const yyyy = now.getUTCFullYear();
+    const [_, dd, mm, hh, mi] = m.map(Number);
+    return new Date(Date.UTC(yyyy, mm-1, dd, hh-7, mi)).toISOString();
+  }
+  // dd/mm (set 17:00)
+  m = s.match(/^(\d{1,2})\/(\d{1,2})$/);
+  if (m) {
+    const now = new Date();
+    const yyyy = now.getUTCFullYear();
+    const [_, dd, mm] = m.map(Number);
+    return new Date(Date.UTC(yyyy, mm-1, dd, 10, 0)).toISOString(); // 17:00 VN = 10:00 UTC
+  }
+  return null;
+}
+
+function nextTaskId(tasks){
+  const max = tasks.reduce((a,t)=>Math.max(a, t.id||0), 0);
+  return max + 1;
+}
 
 // ==== Senders (V3 đúng schema) ====
 async function sendTextToGroup(text){
@@ -62,7 +99,7 @@ async function sendTextToGroup(text){
           Authorization: `Bearer ${ACCESS_TOKEN}`
         },
         validateStatus: () => true,
-        timeout: 10000 // ⏱️
+        timeout: 10000
       }
     );
     console.log('📨 V3 group/message:', r.status, r.data);
@@ -92,13 +129,51 @@ async function sendTextToUser(user_id, text){
           Authorization: `Bearer ${ACCESS_TOKEN}`
         },
         validateStatus: () => true,
-        timeout: 10000 // ⏱️
+        timeout: 10000
       }
     );
     console.log('📨 V3 oa/message:', r.status, r.data);
   } catch(e){
     console.error('❌ Lỗi oa/message:', e.response?.data || e.message);
   }
+}
+
+// ==== Business (tasks & commands) ====
+function renderTaskLine(t){
+  const due = t.dueAt ? ` | hạn: ${fmtDate(t.dueAt)}` : '';
+  const who = t.owner ? ` | phụ trách: ${t.owner}` : '';
+  const st  = t.done ? `✅ (xong ${fmtDate(t.doneAt)})` : '⏳';
+  return `#${t.id} ${st} ${t.message}${who}${due}`;
+}
+
+function reportText(tasks){
+  const done    = tasks.filter(t=>t.done);
+  const pending = tasks.filter(t=>!t.done);
+  let msg = `📅 Báo cáo ${new Date().toLocaleString('vi-VN',{timeZone:VN_TZ})}\n\n`;
+  msg += '✅ ĐÃ HOÀN THÀNH:\n' + (done.length ? done.map(renderTaskLine).join('\n') : '• Không có') + '\n\n';
+  msg += '⚠️ CHƯA HOÀN THÀNH:\n' + (pending.length ? pending.map(renderTaskLine).join('\n') : '• Không có');
+  return msg;
+}
+
+// parse: "/todo nội dung | @nguoiphutrach | 10/11/2025 09:30"
+function parseTodoCommand(text){
+  // cắt "/todo " và chia theo "|"
+  const raw = text.replace(/^\/todo\s*/i,'');
+  const parts = raw.split('|').map(s=>s.trim()).filter(Boolean);
+  const item = { message:'', owner:'', dueAt:null };
+  if (!parts.length) return null;
+  item.message = parts[0];
+
+  for (let i=1;i<parts.length;i++){
+    const p = parts[i];
+    if (p.startsWith('@')) item.owner = p;
+    else {
+      const d = parseDue(p);
+      if (d) item.dueAt = d;
+      else item.message += ' | ' + p; // ghép thêm nếu không nhận diện được
+    }
+  }
+  return item;
 }
 
 // ==== Webhook ====
@@ -109,6 +184,7 @@ app.post('/webhook', async (req,res)=>{
 
   try { fs.writeFileSync(LAST_FILE, JSON.stringify(data,null,2)); } catch {}
 
+  // học group id
   const detectedGroupId =
     data?.recipient?.group_id ||
     data?.message?.conversation_id ||
@@ -117,38 +193,107 @@ app.post('/webhook', async (req,res)=>{
   if (detectedGroupId && !GROUP_ID) saveGroupId(detectedGroupId);
 
   const ev = data.event_name || '';
+
+  // chỉ xử lý text trong nhóm hoặc text từ user
   if (ev === 'user_send_text' || ev === 'group.message') {
     const sender = data.sender?.id || 'unknown';
     const text = (data.message?.text || '').trim();
     if (!text) return;
 
-    if (/^\/groupid$/i.test(text)) {
-      await sendTextToGroup(GROUP_ID ? `GROUP_ID hiện tại: ${GROUP_ID}` : 'Chưa có GROUP_ID.');
+    // ---- COMMANDS ----
+    if (/^\/help$/i.test(text)) {
+      await sendTextToGroup(
+`🤖 Lệnh hỗ trợ:
+• /todo <nội dung> [| @user] [| dd/mm/yyyy hh:mm]
+• /list (all|done|me)
+• /done [id]
+• /report
+Ví dụ: /todo Sửa rò rỉ D90 | @Toan | 12/11/2025 09:30`
+      );
       return;
     }
 
-    let tasks = loadTasks();
-    if (DONE_REGEX.test(text)) {
-      for (let i = tasks.length - 1; i >= 0; i--) {
-        if (tasks[i].sender === sender && !tasks[i].done) { tasks[i].done = true; break; }
-      }
+    if (/^\/todo/i.test(text)) {
+      const info = parseTodoCommand(text);
+      if (!info) { await sendTextToGroup('⚠️ Cú pháp: /todo <nội dung> [| @user] [| dd/mm/yyyy hh:mm]'); return; }
+      const tasks = loadTasks();
+      const t = {
+        id: nextTaskId(tasks),
+        sender, // user_id tạo
+        owner: info.owner || '', // gõ @user nếu muốn
+        message: info.message,
+        dueAt: info.dueAt,
+        createdAt: new Date().toISOString(),
+        done: false,
+        doneAt: null
+      };
+      tasks.push(t);
       saveTasks(tasks);
+      await sendTextToGroup(`📝 Đã tạo việc: ${renderTaskLine(t)}`);
       return;
     }
 
-    tasks.push({ sender, message: text, done: false });
-    saveTasks(tasks);
+    if (/^\/list(\s+.+)?$/i.test(text)) {
+      const arg = (text.split(/\s+/)[1]||'').toLowerCase();
+      const tasks = loadTasks();
+      let list = tasks;
+      if (arg === 'done') list = tasks.filter(t=>t.done);
+      else if (arg === 'me') list = tasks.filter(t=>t.owner || t.sender === sender);
+      else if (arg === 'all' || arg==='') list = tasks.filter(()=>true);
+      else list = tasks.filter(t=>!t.done); // mặc định pending
+
+      if (!list.length){ await sendTextToGroup('📭 Không có việc phù hợp.'); return; }
+
+      const chunk = list.slice(-15); // giới hạn tránh quá dài
+      await sendTextToGroup('📋 Danh sách:\n' + chunk.map(renderTaskLine).join('\n'));
+      return;
+    }
+
+    if (/^\/done(\s+\d+)?$/i.test(text)) {
+      const tasks = loadTasks();
+      const m = text.match(/^\/done\s+(\d+)$/i);
+      if (m) {
+        const id = Number(m[1]);
+        const t = tasks.find(x=>x.id===id);
+        if (!t) { await sendTextToGroup(`⚠️ Không tìm thấy việc #${id}`); return; }
+        t.done = true; t.doneAt = new Date().toISOString();
+        saveTasks(tasks);
+        await sendTextToGroup(`✅ Đã hoàn thành: ${renderTaskLine(t)}`);
+        return;
+      } else {
+        // không id: lấy việc gần nhất của người này chưa done
+        for (let i=tasks.length-1; i>=0; i--){
+          const t = tasks[i];
+          if (!t.done && (t.sender===sender || (t.owner && t.owner.includes('@')))) {
+            t.done = true; t.doneAt = new Date().toISOString();
+            saveTasks(tasks);
+            await sendTextToGroup(`✅ Đã hoàn thành: ${renderTaskLine(t)}`);
+            return;
+          }
+        }
+        await sendTextToGroup('⚠️ Không có việc nào để đánh dấu xong.');
+        return;
+      }
+    }
+
+    if (/^\/report$/i.test(text)) {
+      const tasks = loadTasks();
+      await sendTextToGroup(reportText(tasks));
+      return;
+    }
+
+    // ---- Không phải command: ghi log công việc nhẹ (tuỳ chọn) ----
+    // Bỏ qua: chỉ dùng /todo để tạo việc chuẩn
   }
 });
 
 // ==== Tools / Pages ====
 app.get('/', (req,res)=>{
   res.send(`<h2>💧 Zalo Task Bot (OA API v3)</h2>
-  <p>GROUP_ID: ${GROUP_ID || '(chưa có)'} — <a href="/health">health</a> — <a href="/debug/last">last</a></p>`);
+  <p>GROUP_ID: ${GROUP_ID || '(chưa có)'} — <a href="/health">health</a> — <a href="/debug/last">last</a></p>
+  <p>Commands: /help, /todo, /list, /done, /report</p>`);
 });
 app.get('/health', (req,res)=> res.json({ ok:true, group_id: !!GROUP_ID }));
-
-// Route tự test nội bộ (phân biệt app down hay call Zalo treo)
 app.get('/__selftest', (req,res)=> res.json({ up:true, t:Date.now() }));
 
 app.get('/debug/last', (req,res)=>{
@@ -178,7 +323,7 @@ app.get('/send2-user', async (req,res)=>{
   res.send('Đã gọi gửi 1–1.');
 });
 
-// ==== TOKEN CHECK: 6 tries (V3/V2/root) với header & query param ====
+// ==== TOKEN CHECK: 6 tries (V3/V2/root) ====
 app.get('/token-check', async (req, res) => {
   const token = ACCESS_TOKEN;
   if (!token) return res.status(400).json({ error: 'no_token', message: 'Thiếu ACCESS_TOKEN trong ENV' });
@@ -200,7 +345,7 @@ app.get('/token-check', async (req, res) => {
           Authorization: `Bearer ${token}`
         } : undefined,
         validateStatus: () => true,
-        timeout: 10000 // ⏱️
+        timeout: 10000
       });
       console.log('🔎 token-check try:', t.url, r.status, r.data?.error);
       if (r.status !== 404 && !(r.data && r.data.error === 404)) {
@@ -223,15 +368,20 @@ setInterval(async ()=>{
   const m = now.getUTCMinutes();
   if (hVN === 17 && m === 0) {
     const tasks = loadTasks();
-    const done    = tasks.filter(t=>t.done);
-    const pending = tasks.filter(t=>!t.done);
-    let msg = `📅 Báo cáo ngày ${now.toLocaleDateString('vi-VN', { timeZone:'Asia/Ho_Chi_Minh' })}\n\n`;
-    msg += '✅ ĐÃ HOÀN THÀNH:\n' + (done.length ? done.map(t=>`• ${t.message}`).join('\n') : '• Không có') + '\n\n';
-    msg += '⚠️ CHƯA HOÀN THÀNH:\n' + (pending.length ? pending.map(t=>`• ${t.message}`).join('\n') : '• Không có');
-    await sendTextToGroup(msg);
-    saveTasks([]);
+    await sendTextToGroup(reportText(tasks));
   }
 }, 60*1000);
+
+// ==== Nhắc hạn mỗi 5 phút ====
+setInterval(async ()=>{
+  const tasks = loadTasks();
+  const now = Date.now();
+  const overdue = tasks.filter(t=>!t.done && t.dueAt && new Date(t.dueAt).getTime() < now);
+  if (overdue.length){
+    const msg = '⏰ NHẮC HẠN (quá hạn):\n' + overdue.slice(-10).map(renderTaskLine).join('\n');
+    await sendTextToGroup(msg);
+  }
+}, 5 * 60 * 1000);
 
 app.listen(PORT, ()=>{
   console.log(`🚀 Bot chạy tại cổng ${PORT}`);
