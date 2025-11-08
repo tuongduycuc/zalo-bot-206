@@ -18,12 +18,12 @@ const TASK_FILE  = './tasks.json';
 const GROUP_FILE = './group.json';
 const LAST_FILE  = './public/last_webhook.json';
 
-// OA API v3 base cho gửi tin
+// OA API v3 base cho gửi tin nhắn
 const API_V3 = 'https://openapi.zalo.me/v3.0';
 
 app.use(bodyParser.json());
 
-// ==== helpers ====
+// ==== Helpers ====
 function loadTasks() {
   try { return fs.existsSync(TASK_FILE) ? JSON.parse(fs.readFileSync(TASK_FILE,'utf8')) : []; }
   catch { return []; }
@@ -43,7 +43,7 @@ if (!GROUP_ID) GROUP_ID = loadGroupId();
 
 const DONE_REGEX = /(đã xong|da xong|ok\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
 
-// ==== SENDERS (V3) ====
+// ==== Senders (V3) ====
 
 // Gửi TEXT vào NHÓM GMF
 async function sendTextToGroup(text){
@@ -95,7 +95,7 @@ async function sendTextToUser(user_id, text){
   }
 }
 
-// ==== WEBHOOK ====
+// ==== Webhook ====
 app.post('/webhook', async (req,res)=>{
   const data = req.body || {};
   console.log('📩 Webhook:', JSON.stringify(data));
@@ -138,7 +138,7 @@ app.post('/webhook', async (req,res)=>{
   }
 });
 
-// ==== TOOLS / PAGES ====
+// ==== Tools / Pages ====
 app.get('/', (req,res)=>{
   res.send(`<h2>💧 Zalo Task Bot (OA API v3)</h2>
   <p>GROUP_ID: ${GROUP_ID || '(chưa có)'} — <a href="/health">health</a> — <a href="/debug/last">last</a></p>`);
@@ -175,30 +175,49 @@ app.get('/send2-user', async (req,res)=>{
   res.send('Đã gọi gửi 1–1.');
 });
 
-// ==== TOKEN CHECK: thử V3 trước, nếu 404 thì fallback sang V2 ====
+// ==== TOKEN CHECK: 6 tries (V3/V2/root) với header & query param ====
 app.get('/token-check', async (req, res) => {
-  try {
-    // Thử V3
-    let r = await axios.get(`${API_V3}/oa/getoa`, {
-      headers: {
-        access_token: ACCESS_TOKEN,
-        Authorization: `Bearer ${ACCESS_TOKEN}`
-      },
-      validateStatus: () => true
-    });
+  const token = ACCESS_TOKEN;
+  if (!token) return res.status(400).json({ error: 'no_token', message: 'Thiếu ACCESS_TOKEN trong ENV' });
 
-    // Nếu V3 không có (404/empty api) → fallback sang V2
-    if (r.status === 404 || (r.data && r.data.error === 404)) {
-      r = await axios.get('https://openapi.zalo.me/v2.0/oa/getoa', {
-        headers: { access_token: ACCESS_TOKEN },
-        validateStatus: () => true
+  const tries = [
+    // Header trước
+    { url: 'https://openapi.zalo.me/v3.0/oa/getoa', hdr: true },
+    { url: 'https://openapi.zalo.me/v2.0/oa/getoa', hdr: true },
+    { url: 'https://openapi.zalo.me/oa/getoa',     hdr: true },
+    // Rồi đến query param
+    { url: `https://openapi.zalo.me/v3.0/oa/getoa?access_token=${encodeURIComponent(token)}`, hdr: false },
+    { url: `https://openapi.zalo.me/v2.0/oa/getoa?access_token=${encodeURIComponent(token)}`, hdr: false },
+    { url: `https://openapi.zalo.me/oa/getoa?access_token=${encodeURIComponent(token)}`,     hdr: false },
+  ];
+
+  for (const t of tries) {
+    try {
+      const r = await axios.get(t.url, {
+        headers: t.hdr ? {
+          access_token: token,
+          Authorization: `Bearer ${token}`
+        } : undefined,
+        validateStatus: () => true,
+        timeout: 8000
       });
-    }
 
-    res.status(r.status).json(r.data);
-  } catch (e) {
-    res.status(500).send(e.response?.data || e.message);
+      console.log('🔎 token-check try:', t.url, r.status, r.data?.error);
+
+      // Nếu không còn 404 "empty api" → coi như đã chạm đúng API (trả info OA hoặc lỗi -216…)
+      if (r.status !== 404 && !(r.data && r.data.error === 404)) {
+        return res.status(r.status).json(r.data);
+      }
+    } catch (e) {
+      console.log('token-check error on', t.url, e.message);
+    }
   }
+
+  // Nếu rớt hết
+  return res.status(404).json({
+    error: 404,
+    message: 'All variants returned 404 (empty/invalid api). Hãy kiểm tra lại deploy (clear cache), domain và token.'
+  });
 });
 
 // ==== Báo cáo 17:00 (giờ VN) ====
