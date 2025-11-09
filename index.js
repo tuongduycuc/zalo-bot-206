@@ -1,11 +1,14 @@
 // index.js — Zalo OA Task Bot (v3)
 // - Im lặng khi đánh dấu hoàn thành (DONE_SILENT)
-// - Báo cáo theo lệnh và tự động lúc 17:00
+// - Báo cáo theo lệnh & tự động 17:00
+// - Báo cáo theo khoảng thời gian & xuất Excel (*.xlsx) qua link
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
 import axios from 'axios';
 import fs from 'fs';
+import path from 'path';
+import XLSX from 'xlsx';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -37,7 +40,11 @@ const LAST_FILE  = './public/last_webhook.json';
 const MSG_FILE   = './msgs.json';
 const TOKEN_FILE = './token.json';
 
+// đảm bảo thư mục public/exports tồn tại
+fs.mkdirSync('public/exports', { recursive: true });
+
 app.use(bodyParser.json());
+app.use('/files', express.static('public')); // phục vụ file xuất excel
 
 // ---------- storage ----------
 function safeRead(path, fallback) {
@@ -93,7 +100,7 @@ async function refreshAccessToken() {
 }
 loadPersistedToken();
 
-// ---------- helpers ----------
+// ---------- helpers & tasks ----------
 function loadTasks(){ return safeRead(TASK_FILE, []); }
 function saveTasks(t){ safeWrite(TASK_FILE, t); }
 function nextTaskId(tasks){ return tasks.reduce((m,t)=>Math.max(m,t.id||0),0)+1; }
@@ -185,6 +192,114 @@ async function sendGroup(text){
   }
 }
 
+// ====== PARSE TIME RANGE ======
+function toDate(d) {
+  // Hỗ trợ yyyy-mm-dd, dd/mm/yyyy, dd-mm-yyyy
+  if (!d) return null;
+  const s = String(d).trim();
+  // yyyy-mm-dd
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return new Date(s + 'T00:00:00');
+  // dd/mm/yyyy hoặc dd-mm-yyyy
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (m) {
+    const dd = m[1].padStart(2,'0');
+    const mm = m[2].padStart(2,'0');
+    const yy = m[3];
+    return new Date(`${yy}-${mm}-${dd}T00:00:00`);
+  }
+  return new Date(s); // để JS cố gắng parse
+}
+function startOfDay(d){ const x=new Date(d); x.setHours(0,0,0,0); return x; }
+function endOfDay(d){ const x=new Date(d); x.setHours(23,59,59,999); return x; }
+function addDays(d,n){ const x=new Date(d); x.setDate(x.getDate()+n); return x; }
+
+function resolveShortcut(token) {
+  const now = new Date();
+  const todayS = startOfDay(now);
+  const yesterdayS = addDays(todayS, -1);
+  if (token === 'today')   return { from: todayS, to: endOfDay(todayS) };
+  if (token === 'yesterday') return { from: yesterdayS, to: endOfDay(yesterdayS) };
+
+  // thisweek / lastweek (Mon–Sun)
+  const dow = todayS.getDay() || 7; // 1..7 (Mon..Sun)
+  const weekStart = addDays(todayS, 1 - dow);
+  const lastWeekStart = addDays(weekStart, -7);
+  if (token === 'thisweek') return { from: weekStart, to: endOfDay(addDays(weekStart, 6)) };
+  if (token === 'lastweek') return { from: lastWeekStart, to: endOfDay(addDays(lastWeekStart, 6)) };
+
+  // thismonth / lastmonth
+  const m0 = new Date(todayS.getFullYear(), todayS.getMonth(), 1);
+  const m1 = new Date(todayS.getFullYear(), todayS.getMonth()+1, 0);
+  const lm0 = new Date(todayS.getFullYear(), todayS.getMonth()-1, 1);
+  const lm1 = new Date(todayS.getFullYear(), todayS.getMonth(), 0);
+  if (token === 'thismonth') return { from: m0, to: endOfDay(m1) };
+  if (token === 'lastmonth') return { from: lm0, to: endOfDay(lm1) };
+
+  return null;
+}
+
+function parseRange(args) {
+  // args: [from, to] hoặc [shortcut] hoặc ['done', from, to] …
+  let target = 'createdAt'; // mặc định lọc theo ngày tạo
+  let i = 0;
+  if (String(args[0]||'').toLowerCase() === 'done') { target = 'doneAt'; i = 1; }
+
+  let from=null, to=null;
+  const token = String(args[i]||'').toLowerCase();
+
+  // shortcut
+  const sc = resolveShortcut(token);
+  if (sc) { from = sc.from; to = sc.to; return { target, from, to }; }
+
+  // 2 mốc ngày
+  if (args[i] && args[i+1]) {
+    const f = toDate(args[i]);
+    const t = toDate(args[i+1]);
+    if (f && t && !isNaN(f) && !isNaN(t)) {
+      from = startOfDay(f);
+      to   = endOfDay(t);
+      return { target, from, to };
+    }
+  }
+  // 1 mốc (coi như 1 ngày)
+  if (args[i]) {
+    const f = toDate(args[i]);
+    if (f && !isNaN(f)) { from = startOfDay(f); to = endOfDay(f); return { target, from, to }; }
+  }
+
+  return null;
+}
+
+function filterByRange(tasks, range) {
+  if (!range) return tasks;
+  const { target, from, to } = range;
+  return tasks.filter(t => {
+    const stamp = t[target];
+    if(!stamp) return false;
+    const dt = new Date(stamp);
+    return dt >= from && dt <= to;
+  });
+}
+
+// ====== EXPORT EXCEL ======
+function exportExcel(tasks, filename) {
+  const rows = tasks.map(t => ({
+    id: t.id,
+    message: t.message,
+    owner: t.owner || '',
+    createdAt: t.createdAt || '',
+    dueAt: t.dueAt || '',
+    done: t.done ? 1 : 0,
+    doneAt: t.doneAt || '',
+    sender: t.sender || '',
+    src_msg_id: t.src_msg_id || ''
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Tasks');
+  XLSX.writeFile(wb, filename);
+}
+
 // time helper in TZ
 function getHourMinuteTZ() {
   const parts = new Intl.DateTimeFormat('en-GB', {
@@ -247,6 +362,48 @@ app.post('/webhook', async (req,res)=>{
 
   // commands
   if(/^\/groupid$/i.test(text)){ await sendGroup(GROUP_ID?`GROUP_ID: ${GROUP_ID}`:'Chưa có GROUP_ID.'); return; }
+
+  // --------- REPORT / EXPORT with time range ----------
+  // /report [done] <from> <to> | /report thisweek | ...
+  // /export [done] <from> <to> | /export lastmonth | ...
+  if (/^\/(report|bc)\b/i.test(text) || /^\/export\b/i.test(text)) {
+    const parts = text.split(/\s+/).slice(1); // after command
+    const cmd = text.toLowerCase().startsWith('/export') ? 'export' : 'report';
+    const range = parseRange(parts);
+
+    const tasks = loadTasks();
+    let filtered = tasks;
+
+    if (range) {
+      filtered = filterByRange(tasks, range);
+    }
+
+    if (cmd === 'report') {
+      const msg = (range
+        ? `📅 Báo cáo (${range.target === 'doneAt' ? 'hoàn thành' : 'tạo'}) từ ${fmt(range.from)} đến ${fmt(range.to)}\n\n`
+        : '') + (() => {
+          const done = filtered.filter(x=>x.done);
+          const pend = filtered.filter(x=>!x.done);
+          let s = '';
+          s += '✅ ĐÃ HOÀN THÀNH:\n' + (done.length?done.map(render).join('\n'):'• Không có') + '\n\n';
+          s += '⚠️ CHƯA HOÀN THÀNH:\n' + (pend.length?pend.map(render).join('\n'):'• Không có');
+          return s;
+        })();
+      await sendGroup(msg);
+      return;
+    }
+
+    if (cmd === 'export') {
+      const stamp = new Date();
+      const name = range
+        ? `report_${range.target === 'doneAt' ? 'done' : 'created'}_${stamp.getFullYear()}${String(stamp.getMonth()+1).padStart(2,'0')}${String(stamp.getDate()).padStart(2,'0')}_${String(stamp.getHours()).padStart(2,'0')}${String(stamp.getMinutes()).padStart(2,'0')}.xlsx`
+        : `report_${stamp.getFullYear()}${String(stamp.getMonth()+1).padStart(2,'0')}${String(stamp.getDate()).padStart(2,'0')}_${String(stamp.getHours()).padStart(2,'0')}${String(stamp.getMinutes()).padStart(2,'0')}.xlsx`;
+      const filePath = path.join('public/exports', name);
+      exportExcel(filtered, filePath);
+      await sendGroup(`📦 Đã tạo file: https://${process.env.RENDER_EXTERNAL_URL || req?.headers?.host || 'your-host'}/files/exports/${encodeURIComponent(name)}`);
+      return;
+    }
+  }
 
   if (isReportCmd(text)) { await sendGroup(report(loadTasks())); return; }
 
@@ -341,7 +498,7 @@ app.post('/webhook', async (req,res)=>{
     return;
   }
 
-  // auto create todo (SILENT confirm nếu AUTO_TODO_CONFIRM=false)
+  // auto create todo
   if(AUTO_TODO && inGroup && !text.startsWith('/')){
     if(text.length>=2 && text.length<=400){
       const tasks = loadTasks();
