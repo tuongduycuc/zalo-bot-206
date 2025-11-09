@@ -1,24 +1,16 @@
 {
   "name": "zalo-bot-oa",
   "version": "1.0.0",
-  "description": "Zalo OA GMF task bot (API v3)",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "axios": "^1.7.7",
-    "body-parser": "^1.20.3",
+    "body-parser": "^1.20.2",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.7"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "license": "MIT"
+    "express": "^4.19.2",
+    "xlsx": "^0.18.5"
+  }
 }
