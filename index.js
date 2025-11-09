@@ -24,6 +24,9 @@ const ADMIN_UIDS = (process.env.ADMIN_UIDS || '')
 
 const TZ = process.env.TZ || 'Asia/Ho_Chi_Minh';
 
+// ==== Regex nhận “ok/hoàn thành/đã xong …” ====
+const DONE_REGEX = /(đã xong|da xong|ok\b|okay\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
+
 // ===== Files =====
 const TASK_FILE  = './tasks.json';
 const GROUP_FILE = './group.json';
@@ -60,7 +63,6 @@ const seen = new Map();
 function remember(id){
   const now = Date.now();
   seen.set(id, now);
-  // cleanup
   for (const [k,v] of seen) if (now - v > 10*60*1000) seen.delete(k);
   return true;
 }
@@ -178,12 +180,10 @@ app.post('/webhook', async (req,res)=>{
   const isText = typeof txt === 'string';
   const inGroup = !!(data?.recipient?.group_id || data?.conversation?.id || data?.message?.conversation_id);
 
-  // log gọn – hữu ích khi debug
   console.log('📩 Webhook:', JSON.stringify({
     event: ev, sender: data?.sender?.id, gid: detectedGroupId, msg_id: msgId, text: txt
   }));
 
-  // khử trùng lặp
   if (isDup(msgId)) { console.log('↩️ duplicate ignored'); return; }
   remember(msgId);
 
@@ -282,6 +282,24 @@ Ví dụ: /todo Sửa rò rỉ D90 | @Toan | 12/11/2025 09:30`);
     return;
   }
 
+  // === Natural language: "ok", "hoàn thành", "đã xong" ===
+  if (DONE_REGEX.test(text)) {
+    const tasks = loadTasks();
+    // Ưu tiên: việc gần nhất của chính người nhắn & chưa xong
+    for (let i = tasks.length - 1; i >= 0; i--) {
+      const t = tasks[i];
+      if (!t.done && (t.sender === sender || (t.owner && t.owner.includes('@')))) {
+        t.done = true;
+        t.doneAt = new Date().toISOString();
+        saveTasks(tasks);
+        await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(t)}`);
+        return;
+      }
+    }
+    await sendTextToGroup('⚠️ Không có việc nào để đánh dấu xong.');
+    return;
+  }
+
   // Not a command → bỏ qua
 });
 
@@ -326,7 +344,7 @@ app.get('/token-check', async (req,res)=>{
 setInterval(async ()=>{
   const now = new Date();
   const min = now.getUTCMinutes();
-  const hourVN = (now.getUTCHours() + (TZ.includes('Ho_Chi_Minh') ? 7 : 7)) % 24; // đơn giản hoá
+  const hourVN = (now.getUTCHours() + 7) % 24; // đơn giản hoá: VN = UTC+7
   if (hourVN === 17 && min === 0){
     const tasks = loadTasks();
     await sendTextToGroup(reportText(tasks));
