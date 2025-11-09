@@ -1,3 +1,4 @@
+// index.js — Zalo OA Task Bot (v3) — full file
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
@@ -38,9 +39,22 @@ function norm(s){
   const noAt = clean(String(s||'').replace(/(^|\s)@\S+/g,' '));
   return noAt.toLowerCase()
     .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
-    .replace(/[^\p{L}\p{N}\s]/gu,' ') // bỏ kí tự lạ
+    .replace(/[^\p{L}\p{N}\s]/gu,' ')
     .replace(/\s+/g,' ')
     .trim();
+}
+
+// === Alias lệnh báo cáo (mới) ===
+function isReportCmd(s) {
+  const t = norm(s);
+  return (
+    /^\/report$/i.test(s) ||
+    /^\/bc$/i.test(s) ||
+    t === 'bc' ||
+    t === 'bao cao' ||
+    t === 'baocao' ||
+    t === 'bao-cao'
+  );
 }
 
 function loadTasks(){ return safeRead(TASK_FILE, []); }
@@ -169,7 +183,13 @@ app.post('/webhook', async (req,res)=>{
 
   // commands
   if(/^\/groupid$/i.test(text)){ await sendGroup(GROUP_ID?`GROUP_ID: ${GROUP_ID}`:'Chưa có GROUP_ID.'); return; }
-  if(/^\/report$/i.test(text)){ await sendGroup(report(loadTasks())); return; }
+
+  // === dùng alias báo cáo (bc, /bc, báo cáo, baocao, ...) ===
+  if (isReportCmd(text)) { 
+    await sendGroup(report(loadTasks())); 
+    return; 
+  }
+
   if(/^\/list$/i.test(text)){
     const tasks = loadTasks();
     if(!tasks.length){ await sendGroup('📭 Không có việc.'); return; }
@@ -216,7 +236,7 @@ app.post('/webhook', async (req,res)=>{
       console.log('  ➜ match by text:', !!t);
     }
 
-    // 3) JIT from cache if still not found (only when have quoteId)
+    // 3) JIT from cache if still not found
     if(!t && quoteId){
       const rec = loadMsgs().find(m=>m.msg_id===quoteId);
       if(rec && rec.text){
