@@ -1,4 +1,4 @@
-// index.js — Zalo OA Task Bot (v3) — full file with auto refresh token
+// index.js — Zalo OA Task Bot (v3) — silent confirm + daily report 17:00
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
@@ -17,6 +17,10 @@ const TZ = process.env.TZ || 'Asia/Ho_Chi_Minh';
 const ONLY_ADMINS = String(process.env.ONLY_ADMINS || 'false').toLowerCase() === 'true';
 const ADMIN_UIDS  = (process.env.ADMIN_UIDS || '').split(',').map(s=>s.trim()).filter(Boolean);
 const AUTO_TODO   = String(process.env.AUTO_TODO || 'true').toLowerCase() === 'true';
+const AUTO_TODO_CONFIRM = String(process.env.AUTO_TODO_CONFIRM || 'true').toLowerCase() === 'true';
+
+const DAILY_H = Number(process.env.DAILY_REPORT_HOUR || 17);
+const DAILY_M = Number(process.env.DAILY_REPORT_MINUTE || 0);
 
 const DONE_REGEX  = /(đã xong|da xong|\bok\b|okay|xong\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
 
@@ -30,7 +34,7 @@ const TOKEN_FILE = './token.json';
 
 app.use(bodyParser.json());
 
-// ---------- storage helpers ----------
+// ---------- storage ----------
 function safeRead(path, fallback) {
   try { return fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf8')) : fallback; }
   catch { return fallback; }
@@ -50,7 +54,7 @@ function norm(s){
     .trim();
 }
 
-// === Alias lệnh báo cáo ===
+// Alias lệnh báo cáo
 function isReportCmd(s) {
   const t = norm(s);
   return (
@@ -71,14 +75,12 @@ function loadPersistedToken() {
   }
 }
 function persistToken(access_token, expires_in_sec) {
-  const expires_at = Date.now() + (Number(expires_in_sec || 3600) - 60) * 1000; // trừ 60s an toàn
+  const expires_at = Date.now() + (Number(expires_in_sec || 3600) - 60) * 1000;
   safeWrite(TOKEN_FILE, { access_token, expires_at });
   ACCESS_TOKEN = access_token;
   console.log('🔄 Token refreshed. Expires at:', new Date(expires_at).toISOString());
 }
 
-// Một số OA cấp refresh qua endpoint v3: POST /oa/access_token {refresh_token}
-// Nếu OA bạn khác endpoint, thay URL dưới theo tài liệu OA của bạn.
 async function refreshAccessToken() {
   if (!REFRESH_TOKEN) {
     console.log('⚠️ REFRESH_TOKEN chưa cấu hình, không thể làm mới access_token.');
@@ -90,7 +92,6 @@ async function refreshAccessToken() {
       { refresh_token: REFRESH_TOKEN },
       { headers: { 'Content-Type': 'application/json' }, validateStatus:()=>true, timeout:10000 }
     );
-    // Kỳ vọng { access_token, expires_in }
     if (r.status === 200 && r.data?.access_token) {
       persistToken(r.data.access_token, r.data.expires_in || 3600);
       return true;
@@ -102,11 +103,9 @@ async function refreshAccessToken() {
     return false;
   }
 }
-
-// Khi khởi động – đọc token từ file nếu có
 loadPersistedToken();
 
-// ---------- basic data ----------
+// ---------- helpers ----------
 function loadTasks(){ return safeRead(TASK_FILE, []); }
 function saveTasks(t){ safeWrite(TASK_FILE, t); }
 function nextTaskId(tasks){ return tasks.reduce((m,t)=>Math.max(m,t.id||0),0)+1; }
@@ -150,7 +149,7 @@ function isDup(id){ return id && seen.has(id); }
 const isAdmin = uid => ADMIN_UIDS.includes(String(uid));
 const allow   = uid => !ONLY_ADMINS || isAdmin(uid);
 
-// ---------- quote info ----------
+// Quote info
 function getQuoteInfo(data){
   const m = data?.message || {};
   const qid =
@@ -167,7 +166,7 @@ function getQuoteInfo(data){
   return { quoteId: qid, quoteText: qtxt, quoteSender: qsender };
 }
 
-// ---------- send to group with auto refresh ----------
+// send to group with auto refresh
 async function zaloGroupMessage(text) {
   return axios.post(
     `${API_V3}/oa/group/message`,
@@ -183,16 +182,11 @@ async function zaloGroupMessage(text) {
     }
   );
 }
-
 async function sendGroup(text){
   if(!GROUP_ID){ console.log('⚠️ No GROUP_ID'); return; }
   if(!ACCESS_TOKEN){ console.log('⚠️ No ACCESS_TOKEN'); return; }
-
-  // lần 1
   let r = await zaloGroupMessage(text);
   console.log('📨 v3 group/message:', r.status, r.data);
-
-  // nếu token hết hạn/invalid thì refresh và retry 1 lần
   const expired = (r.status===401) || (r.data?.error === -216);
   if (expired) {
     const ok = await refreshAccessToken();
@@ -201,6 +195,16 @@ async function sendGroup(text){
       console.log('📨 retry v3 group/message:', r.status, r.data);
     }
   }
+}
+
+// time helper in TZ
+function getHourMinuteTZ() {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false
+  }).formatToParts(new Date());
+  const hh = Number(parts.find(p=>p.type==='hour').value);
+  const mm = Number(parts.find(p=>p.type==='minute').value);
+  return { hh, mm };
 }
 
 // ---------- routes ----------
@@ -244,7 +248,6 @@ app.post('/webhook', async (req,res)=>{
   const text = clean(text0);
   if(!text) return;
 
-  // cache msg
   if(inGroup && msgId){
     const msgs = loadMsgs();
     msgs.unshift({ msg_id: msgId, text, sender, timestamp: Date.now() });
@@ -280,7 +283,7 @@ app.post('/webhook', async (req,res)=>{
     await sendGroup('⚠️ Không có việc nào để đánh dấu xong.'); return;
   }
 
-  // handle OK / done by quote
+  // OK/done qua quote
   if(DONE_REGEX.test(text)){
     const tasks = loadTasks();
     const {quoteId, quoteText, quoteSender} = getQuoteInfo(data);
@@ -343,7 +346,7 @@ app.post('/webhook', async (req,res)=>{
     return;
   }
 
-  // auto create todo
+  // auto create todo (SILENT nếu AUTO_TODO_CONFIRM=false)
   if(AUTO_TODO && inGroup && !text.startsWith('/')){
     if(text.length>=2 && text.length<=400){
       const tasks = loadTasks();
@@ -360,10 +363,23 @@ app.post('/webhook', async (req,res)=>{
         src_sender: sender
       };
       tasks.push(t); saveTasks(tasks);
-      await sendGroup(`📝 Đã ghi nhận việc: ${render(t)}`);
+      if (AUTO_TODO_CONFIRM) {
+        await sendGroup(`📝 Đã ghi nhận việc: ${render(t)}`);
+      }
     }
   }
 });
+
+// ---------- daily report 17:00 ----------
+let lastTick = '';
+setInterval(async ()=>{
+  const { hh, mm } = getHourMinuteTZ();
+  const key = `${hh}:${mm}`;
+  if (hh === DAILY_H && mm === DAILY_M && key !== lastTick) {
+    lastTick = key;
+    await sendGroup(report(loadTasks()));
+  }
+}, 60 * 1000);
 
 // ---------- start ----------
 app.listen(PORT, ()=>{
