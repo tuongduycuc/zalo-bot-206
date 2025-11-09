@@ -73,6 +73,29 @@ function isDup(id) { return id && seen.has(id); }
 
 // ===== Helpers =====
 function cleanText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+
+function stripMentions(s) {
+  return String(s || '').replace(/@\S+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function normalizeForMatch(s) {
+  return stripMentions(cleanText(s))
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function fuzzyMatch(a, b) {
+  const A = normalizeForMatch(a);
+  const B = normalizeForMatch(b);
+  if (!A || !B) return false;
+  if (A.includes(B) || B.includes(A)) return true;
+  const wa = new Set(A.split(' ').filter(w => w.length > 1));
+  const wb = new Set(B.split(' ').filter(w => w.length > 1));
+  let hit = 0;
+  for (const w of wa) if (wb.has(w)) hit++;
+  return hit >= 2; // trùng >= 2 từ
+}
+
 function getQuoteInfo(data) {
   const qObj = data?.message?.quoted_message || data?.message?.quote || {};
   const quoteId =
@@ -223,7 +246,7 @@ app.post('/webhook', async (req, res) => {
 • /list (all|done|me)
 • /done [id]
 • /report
-Có thể chỉ reply “ok/hoàn thành/đã xong” vào tin gốc để chốt việc.`);
+Có thể reply “ok/hoàn thành/đã xong” vào tin gốc để chốt việc.`);
     return;
   }
 
@@ -241,6 +264,7 @@ Có thể chỉ reply “ok/hoàn thành/đã xong” vào tin gốc để chố
       sender,
       owner: info.owner || '',
       message: info.message,
+      norm: normalizeForMatch(info.message),
       dueAt: info.dueAt,
       createdAt: new Date().toISOString(),
       done: false,
@@ -304,9 +328,13 @@ Có thể chỉ reply “ok/hoàn thành/đã xong” vào tin gốc để chố
       // 1) tìm việc theo msg_id nguồn
       let t = tasks.find(x => !x.done && x.src_msg_id === quoteId);
 
-      // 2) nếu chưa có, thử theo nội dung tin gốc
+      // 2) nếu chưa có, thử theo nội dung tin gốc (chuẩn hoá)
       if (!t && quoteText) {
-        t = tasks.find(x => !x.done && cleanText(x.message) === quoteText);
+        t = tasks.find(x =>
+          !x.done &&
+          (x.norm === normalizeForMatch(quoteText) ||
+           cleanText(x.message) === cleanText(quoteText))
+        );
       }
 
       // 3) nếu vẫn chưa có → tạo “just-in-time” từ tin được reply rồi chốt
@@ -316,6 +344,7 @@ Có thể chỉ reply “ok/hoàn thành/đã xong” vào tin gốc để chố
           sender: quoteSender || sender,
           owner: '',
           message: quoteText,
+          norm: normalizeForMatch(quoteText),
           dueAt: null,
           createdAt: new Date().toISOString(),
           done: false,
@@ -326,7 +355,24 @@ Có thể chỉ reply “ok/hoàn thành/đã xong” vào tin gốc để chố
         tasks.push(t);
       }
 
+      // 3b) fuzzy match nếu vẫn chưa ra
+      if (!t && quoteText) {
+        const tasks2 = tasks
+          .filter(x => !x.done)
+          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+        const normQ = normalizeForMatch(quoteText);
+        t = tasks2.find(x =>
+          (x.norm && (x.norm === normQ || fuzzyMatch(x.norm, normQ))) ||
+          fuzzyMatch(x.message, quoteText)
+        );
+      }
+
       if (t) {
+        if (t.done) {
+          await sendTextToGroup(`ℹ️ Việc này đã được đánh dấu xong trước đó: ${renderTask(t)}`);
+          return;
+        }
         t.done = true;
         t.doneAt = new Date().toISOString();
         saveTasks(tasks);
@@ -358,6 +404,7 @@ Có thể chỉ reply “ok/hoàn thành/đã xong” vào tin gốc để chố
         sender,
         owner: '',
         message: content,
+        norm: normalizeForMatch(content), // << dùng khi fuzzy
         dueAt: null,
         createdAt: new Date().toISOString(),
         done: false,
