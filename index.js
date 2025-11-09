@@ -1,4 +1,4 @@
-// index.js — Zalo OA GMF bot (API v3, ES Module, Node >=18)
+// index.js — Zalo OA GMF Task Bot (API v3, ES Module)
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
@@ -10,7 +10,7 @@ axios.defaults.timeout = 10000;
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ===== ENV =====
+// ====== ENV ======
 const ACCESS_TOKEN =
   process.env.ZALO_OA_ACCESS_TOKEN ||
   process.env.ACCESS_TOKEN || '';
@@ -24,24 +24,22 @@ const ADMIN_UIDS = (process.env.ADMIN_UIDS || '')
   .map(s => s.trim())
   .filter(Boolean);
 
-// Tự tạo task từ tin nhắn thường
+// Tự tạo việc từ tin nhắn thường (không có /)
 const AUTO_TODO = String(process.env.AUTO_TODO || 'true').toLowerCase() === 'true';
 
-// Nhận dạng người dùng nhắn OK/Hoàn thành/Đã xong…
+// Nhận dạng “ok/hoàn thành/đã xong…”
 const DONE_REGEX = /(đã xong|da xong|ok\b|okay\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
 
-// ===== Files =====
+// ====== FILES ======
 const TASK_FILE  = './tasks.json';
 const GROUP_FILE = './group.json';
 const LAST_FILE  = './public/last_webhook.json';
 
-// API
 const API_V3 = 'https://openapi.zalo.me/v3.0';
 
-// Express
 app.use(bodyParser.json());
 
-// ===== Utils: load/save =====
+// ====== Utils ======
 function loadTasks() {
   try { return fs.existsSync(TASK_FILE) ? JSON.parse(fs.readFileSync(TASK_FILE, 'utf8')) : []; }
   catch { return []; }
@@ -61,7 +59,7 @@ if (!GROUP_ID) GROUP_ID = loadGroupId();
 
 const fmt = (d) => new Date(d).toLocaleString('vi-VN', { timeZone: TZ });
 
-// de-dup: giữ 300 msg_id gần nhất/10 phút
+// de-dup: giữ 300 msg gần nhất/10 phút
 const seen = new Map();
 function remember(id) {
   const now = Date.now();
@@ -71,7 +69,7 @@ function remember(id) {
 }
 function isDup(id) { return id && seen.has(id); }
 
-// ===== Send helpers (v3) =====
+// ====== Send helpers (v3) ======
 async function sendTextToGroup(text) {
   if (!GROUP_ID) return console.log('⚠️ No GROUP_ID');
   if (!ACCESS_TOKEN) return console.log('⚠️ No ACCESS_TOKEN');
@@ -111,7 +109,7 @@ async function sendTextToUser(user_id, text) {
   } catch (e) { console.error('❌ oa/message:', e.response?.data || e.message); }
 }
 
-// ===== Task helpers =====
+// ====== Task helpers ======
 function nextTaskId(tasks) { return tasks.reduce((m, t) => Math.max(m, t.id || 0), 0) + 1; }
 function renderTask(t) {
   const due = t.dueAt ? ` | hạn: ${fmt(t.dueAt)}` : '';
@@ -154,11 +152,11 @@ function parseTodo(text) {
   return item;
 }
 
-// ===== Permissions =====
+// ====== Perms ======
 function isAdmin(uid) { return ADMIN_UIDS.includes(String(uid)); }
 function assertPerm(uid) { return !ONLY_ADMINS || isAdmin(uid); }
 
-// ===== Webhook =====
+// ====== Webhook ======
 app.post('/webhook', async (req, res) => {
   const data = req.body || {};
   res.status(200).send('OK');
@@ -199,7 +197,7 @@ app.post('/webhook', async (req, res) => {
     return;
   }
 
-  // ===== Commands =====
+  // ---- Commands ----
   if (/^\/help$/i.test(text)) {
     await sendTextToGroup(
 `🤖 Lệnh:
@@ -208,7 +206,9 @@ app.post('/webhook', async (req, res) => {
 • /list (all|done|me)
 • /done [id]
 • /report
-(Có thể chỉ nhắn “ok/hoàn thành/đã xong” khi **reply** vào tin gốc để chốt việc)`);
+
+*TIP:* bạn có thể reply “ok/hoàn thành/đã xong…” vào tin gốc để chốt việc.`
+    );
     return;
   }
 
@@ -279,16 +279,30 @@ app.post('/webhook', async (req, res) => {
     return;
   }
 
-  // === Natural language: "ok", "hoàn thành", "đã xong" (ưu tiên reply vào tin gốc) ===
+  // === DONE (natural language) — robust reply matching ===
   if (DONE_REGEX.test(text)) {
+    // helper trong-block
+    const getQuoteId = (payload) =>
+      payload?.message?.quote_msg_id ||
+      payload?.message?.quoted_message?.msg_id ||
+      payload?.message?.quote?.msg_id ||
+      payload?.message?.quote_message_id ||
+      payload?.quoted_message?.msg_id ||
+      payload?.message?.reply?.message_id ||
+      payload?.reply?.message_id || '';
+
+    const getQuoteText = (payload) =>
+      payload?.message?.quoted_message?.text ||
+      payload?.message?.quote?.text ||
+      payload?.quoted_message?.text || '';
+
+    const norm = (s) =>
+      String(s || '').toLowerCase().normalize('NFC').replace(/\s+/g, ' ').trim();
+
     const tasks = loadTasks();
 
-    // Quote/reply id
-    const quoteId =
-      data?.message?.quote_msg_id ||
-      data?.message?.quoted_message?.msg_id ||
-      data?.message?.quote?.msg_id || '';
-
+    // 1) Ưu tiên match theo message-id của tin bạn reply
+    const quoteId = getQuoteId(data);
     if (quoteId) {
       const t = tasks.find(x => !x.done && x.src_msg_id === quoteId);
       if (t) {
@@ -300,20 +314,44 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // Fallback: việc gần nhất của người nhắn
+    // 2) Nếu không có ID → thử theo nội dung trích dẫn (quoted text)
+    const qText = getQuoteText(data);
+    if (qText) {
+      const nq = norm(qText);
+      const cand = tasks
+        .filter(x => !x.done)
+        .reverse()
+        .find(x => {
+          const nm = norm(x.message);
+          return nm && nq && (nm.includes(nq) || nq.includes(nm));
+        });
+
+      if (cand) {
+        cand.done = true;
+        cand.doneAt = new Date().toISOString();
+        saveTasks(tasks);
+        await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(cand)}`);
+        return;
+      }
+    }
+
+    // 3) Fallback: chốt việc mở gần nhất của chính người nhắn
     for (let i = tasks.length - 1; i >= 0; i--) {
       const t = tasks[i];
       if (!t.done && (t.sender === sender || (t.owner && t.owner.includes('@')))) {
-        t.done = true; t.doneAt = new Date().toISOString(); saveTasks(tasks);
+        t.done = true;
+        t.doneAt = new Date().toISOString();
+        saveTasks(tasks);
         await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(t)}`);
         return;
       }
     }
+
     await sendTextToGroup('⚠️ Không có việc nào để đánh dấu xong.');
     return;
   }
 
-  // --- Auto-TODO từ tin nhắn thường (không có /) ---
+  // --- Auto-TODO từ tin nhắn thường ---
   if (AUTO_TODO && inGroup && !text.startsWith('/')) {
     if (text.length >= 4 && text.length <= 200) {
       const tasks = loadTasks();
@@ -326,7 +364,7 @@ app.post('/webhook', async (req, res) => {
         createdAt: new Date().toISOString(),
         done: false,
         doneAt: null,
-        src_msg_id: msgId,   // lưu msg_id của tin nguồn để bắt reply
+        src_msg_id: msgId,       // để map với reply
         src_sender: sender
       };
       tasks.push(t);
@@ -336,10 +374,10 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
-  // Not a command → bỏ qua
+  // not a command → bỏ qua
 });
 
-// ===== Routes =====
+// ====== Routes ======
 app.get('/', (req, res) => {
   res.send(`<h3>💧 Zalo Task Bot (v3)</h3>
   <div>GROUP_ID: ${GROUP_ID || '(none)'} —
@@ -353,7 +391,7 @@ app.get('/send', async (req, res) => { const text = String(req.query.text || '')
 app.get('/send2-user', async (req, res) => { const uid = String(req.query.uid || '').trim(); const text = String(req.query.text || 'hi').trim(); if (!uid) return res.status(400).send('missing ?uid'); await sendTextToUser(uid, text); res.send('sent'); });
 app.get('/report-now', async (req, res) => { const tasks = loadTasks(); await sendTextToGroup(reportText(tasks)); res.send('OK, báo cáo đã gửi vào nhóm.'); });
 
-// Token check (thử nhiều biến thể)
+// Token-check (thử nhiều biến thể để debug)
 app.get('/token-check', async (req, res) => {
   const token = ACCESS_TOKEN;
   if (!token) return res.status(400).json({ error: 'no_token' });
@@ -378,7 +416,7 @@ app.get('/token-check', async (req, res) => {
   res.status(404).json({ error: 404, message: 'all variants 404' });
 });
 
-// Report 17:00 hàng ngày (UTC+7)
+// Báo cáo 17:00 hàng ngày (UTC+7)
 setInterval(async () => {
   const now = new Date();
   const min = now.getUTCMinutes();
