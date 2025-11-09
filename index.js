@@ -1,5 +1,4 @@
 // index.js — Zalo OA GMF bot (API v3, ES Module)
-// Chạy: npm i express body-parser axios dotenv
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
@@ -17,33 +16,40 @@ const ACCESS_TOKEN =
 let GROUP_ID = process.env.GROUP_ID || '';
 const TZ = process.env.TZ || 'Asia/Ho_Chi_Minh';
 
-// (tùy chọn) chỉ cho phép admin dùng lệnh
 const ONLY_ADMINS = String(process.env.ONLY_ADMINS || 'false').toLowerCase() === 'true';
 const ADMIN_UIDS = (process.env.ADMIN_UIDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-// Bật tạo việc tự động khi có tin nhắn thường
 const AUTO_TODO = String(process.env.AUTO_TODO || 'true').toLowerCase() === 'true';
 
-// Regex nhận diện hoàn thành
+// Regex “xong”
 const DONE_REGEX = /(đã xong|da xong|\bok\b|okay|xong\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
 
 // ==== Files ====
 const TASK_FILE  = './tasks.json';
 const GROUP_FILE = './group.json';
 const LAST_FILE  = './public/last_webhook.json';
+// NEW: cache tin nhắn gần đây để truy xuất text theo quote_msg_id
+const MSG_FILE   = './msgs.json';
 
-// API v3
 const API_V3 = 'https://openapi.zalo.me/v3.0';
 
 app.use(bodyParser.json());
 
 // ==== load/save ====
-function loadTasks() {
-  try { return fs.existsSync(TASK_FILE) ? JSON.parse(fs.readFileSync(TASK_FILE, 'utf8')) : []; }
-  catch { return []; }
+function safeRead(path, fallback) {
+  try { return fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf8')) : fallback; }
+  catch { return fallback; }
 }
+function loadTasks() { return safeRead(TASK_FILE, []); }
 function saveTasks(tasks) { fs.writeFileSync(TASK_FILE, JSON.stringify(tasks, null, 2)); }
+
+function loadMsgs() { return safeRead(MSG_FILE, []); } // [{msg_id,text,sender,timestamp}]
+function saveMsgs(msgs) {
+  // giữ tối đa 500 bản ghi mới nhất
+  msgs.sort((a,b) => (b.timestamp||0) - (a.timestamp||0));
+  fs.writeFileSync(MSG_FILE, JSON.stringify(msgs.slice(0, 500), null, 2));
+}
 
 function loadGroupId() {
   try {
@@ -64,7 +70,7 @@ const fmt = d => new Date(d).toLocaleString('vi-VN', { timeZone: TZ });
 
 function cleanText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
 
-// >>> BẢN VÁ NHẬN DIỆN: bỏ mention, bỏ dấu, hạ thường để so khớp “mềm”
+// So khớp “mềm”: bỏ @mention, bỏ dấu, hạ thường
 function normalizeForMatch(s) {
   const noMention = cleanText(String(s || '').replace(/(^|\s)@\S+/g, ' '));
   return noMention
@@ -75,7 +81,7 @@ function normalizeForMatch(s) {
     .trim();
 }
 
-// >>> BẢN VÁ NHẬN DIỆN: đọc đủ biến thể quoted/quote/reply_to
+// Lấy info tin được reply/quote ở mọi biến thể payload
 function getQuoteInfo(data) {
   const m = data?.message || {};
   const q = m.quoted_message || m.quote || m.reply_to || {};
@@ -171,19 +177,38 @@ app.post('/webhook', async (req, res) => {
   const ev     = data.event_name || '';
   const text0  = data?.message?.text;
   const msgId  = data?.message?.msg_id || data?.msg_id;
-  const inGrp  = !!(data?.recipient?.group_id || data?.conversation?.id || data?.message?.conversation_id);
   const sender = data?.sender?.id || 'unknown';
 
-  // tự lưu GROUP_ID nếu thấy từ payload
-  const detectedGid = data?.recipient?.group_id || data?.message?.conversation_id || data?.conversation?.id || '';
+  // DETECT GROUP_ID nếu payload có
+  const detectedGid =
+    data?.recipient?.group_id ||
+    data?.message?.conversation_id ||
+    data?.conversation?.id ||
+    '';
   if (detectedGid && !GROUP_ID) saveGroupId(detectedGid);
 
-  console.log('📩', JSON.stringify({ ev, sender, gid: detectedGid, msgId, text0 }));
+  // NHẬN DIỆN TIN NHÓM CHẮC CHẮN
+  const inGroup =
+    !!(data?.recipient?.group_id ||
+       data?.message?.conversation_id ||
+       data?.conversation?.id ||
+       data?.message?.group_id ||
+       (data?.recipient?.id && GROUP_ID && data.recipient.id === GROUP_ID)) ||
+    /_group_/.test(ev) || ev === 'user_send_group_text';
+
+  console.log('📩', JSON.stringify({ ev, sender, gid: detectedGid, msgId, text0, inGroup }));
   if (isDup(msgId)) return; remember(msgId);
 
   if (typeof text0 !== 'string') return;
   const text = cleanText(text0);
   if (!text) return;
+
+  // Lưu cache tin nhắn (để tra theo quote_msg_id khi cần)
+  if (inGroup && msgId) {
+    const msgs = loadMsgs();
+    msgs.unshift({ msg_id: msgId, text, sender, timestamp: Date.now() });
+    saveMsgs(msgs);
+  }
 
   if (!assertPerm(sender)) {
     await sendTextToGroup('⛔ Bạn không có quyền dùng lệnh này.');
@@ -199,18 +224,17 @@ app.post('/webhook', async (req, res) => {
     await sendTextToGroup('📋 Danh sách:\n' + tasks.slice(-20).map(renderTask).join('\n')); return;
   }
 
-  // ======= BẢN VÁ NHẬN DIỆN HOÀN THÀNH (chỉ thay khối này) =======
+  // ======= XỬ LÝ “OK/HOÀN THÀNH” =======
   if (DONE_REGEX.test(text)) {
     const tasks = loadTasks();
-
-    // Lấy thông tin reply/quote nếu có
     const { quoteId, quoteText, quoteSender } = getQuoteInfo(data);
+    let t = null;
 
     if (quoteId || quoteText) {
-      // 1) Tìm theo id nguồn
-      let t = tasks.find(x => !x.done && x.src_msg_id && x.src_msg_id === quoteId);
+      // 1) Tìm theo msg_id nguồn
+      t = tasks.find(x => !x.done && x.src_msg_id && x.src_msg_id === quoteId);
 
-      // 2) Nếu chưa thấy, so khớp "mềm" theo nội dung tin gốc (bỏ @, bỏ dấu)
+      // 2) Nếu chưa thấy: so khớp “mềm” theo nội dung tin gốc
       if (!t && quoteText) {
         const qn = normalizeForMatch(quoteText);
         t = tasks.find(x => {
@@ -220,7 +244,28 @@ app.post('/webhook', async (req, res) => {
         });
       }
 
-      // 3) Nếu vẫn chưa thấy mà có text tin gốc -> tạo “just-in-time” rồi chốt
+      // 3) Nếu vẫn chưa thấy & không có quoteText, thử lấy từ cache msgs
+      if (!t && quoteId && !quoteText) {
+        const msgs = loadMsgs();
+        const rec = msgs.find(m => m.msg_id === quoteId);
+        if (rec && rec.text) {
+          t = {
+            id: nextTaskId(tasks),
+            sender: rec.sender || sender,
+            owner: '',
+            message: cleanText(rec.text),
+            dueAt: null,
+            createdAt: new Date().toISOString(),
+            done: false,
+            doneAt: null,
+            src_msg_id: quoteId,
+            src_sender: rec.sender || sender
+          };
+          tasks.push(t);
+        }
+      }
+
+      // 4) Nếu vẫn chưa thấy & có quoteText → tạo JIT rồi chốt
       if (!t && quoteText) {
         t = {
           id: nextTaskId(tasks),
@@ -246,13 +291,13 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // 4) Fallback: không reply -> chốt việc mở gần nhất của người nhắn
+    // 5) Fallback: không reply → chốt việc mở gần nhất của người nhắn
     for (let i = tasks.length - 1; i >= 0; i--) {
-      const t = tasks[i];
-      if (!t.done && (t.sender === sender || (t.owner && t.owner.includes('@')))) {
-        t.done = true; t.doneAt = new Date().toISOString();
+      const _t = tasks[i];
+      if (!_t.done && (_t.sender === sender || (_t.owner && _t.owner.includes('@')))) {
+        _t.done = true; _t.doneAt = new Date().toISOString();
         saveTasks(tasks);
-        await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(t)}`);
+        await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(_t)}`);
         return;
       }
     }
@@ -260,10 +305,10 @@ app.post('/webhook', async (req, res) => {
     await sendTextToGroup('⚠️ Không có việc nào để đánh dấu xong.');
     return;
   }
-  // ======= HẾT KHỐI VÁ =======
+  // ======= HẾT PHẦN “OK” =======
 
-  // Auto tạo việc từ tin nhắn thường (giữ nguyên)
-  if (AUTO_TODO && inGrp && !text.startsWith('/')) {
+  // Auto tạo việc từ tin nhắn thường
+  if (AUTO_TODO && inGroup && !text.startsWith('/')) {
     const content = cleanText(text);
     if (content.length >= 2 && content.length <= 400) {
       const tasks = loadTasks();
@@ -276,7 +321,7 @@ app.post('/webhook', async (req, res) => {
         createdAt: new Date().toISOString(),
         done: false,
         doneAt: null,
-        src_msg_id: msgId,      // <— quan trọng để lần sau reply khớp theo id
+        src_msg_id: msgId,          // quan trọng để reply theo id
         src_sender: sender
       };
       tasks.push(t);
@@ -289,7 +334,7 @@ app.post('/webhook', async (req, res) => {
   // Không phải lệnh → bỏ qua
 });
 
-// ==== routes nhỏ để debug ====
+// ==== routes nhỏ ====
 app.get('/', (req, res) => {
   res.send(`<h3>💧 Zalo Task Bot (v3)</h3>
   <div>GROUP_ID: ${GROUP_ID || '(none)'}
