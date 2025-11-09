@@ -279,77 +279,109 @@ app.post('/webhook', async (req, res) => {
     return;
   }
 
-  // === DONE (natural language) — robust reply matching ===
-  if (DONE_REGEX.test(text)) {
-    // helper trong-block
-    const getQuoteId = (payload) =>
-      payload?.message?.quote_msg_id ||
-      payload?.message?.quoted_message?.msg_id ||
-      payload?.message?.quote?.msg_id ||
-      payload?.message?.quote_message_id ||
-      payload?.quoted_message?.msg_id ||
-      payload?.message?.reply?.message_id ||
-      payload?.reply?.message_id || '';
+// === DONE (natural language) — robust reply matching + auto-create ===
+if (DONE_REGEX.test(text)) {
+  // Helpers trong-block
+  const getQuoteId = (payload) =>
+    payload?.message?.quote_msg_id ||
+    payload?.message?.quoted_message?.msg_id ||
+    payload?.message?.quote?.msg_id ||
+    payload?.message?.quote_message_id ||
+    payload?.quoted_message?.msg_id ||
+    payload?.message?.reply?.message_id ||
+    payload?.reply?.message_id || '';
 
-    const getQuoteText = (payload) =>
-      payload?.message?.quoted_message?.text ||
-      payload?.message?.quote?.text ||
-      payload?.quoted_message?.text || '';
+  const getQuoteText = (payload) =>
+    payload?.message?.quoted_message?.text ||
+    payload?.message?.quote?.text ||
+    payload?.quoted_message?.text || '';
 
-    const norm = (s) =>
-      String(s || '').toLowerCase().normalize('NFC').replace(/\s+/g, ' ').trim();
+  const norm = (s) =>
+    String(s || '')
+      .toLowerCase()
+      .normalize('NFC')
+      .replace(/\s+/g, ' ')
+      .trim();
 
-    const tasks = loadTasks();
+  // Bóc nội dung “cốt lõi” để so khớp: bỏ @mention, bỏ ‘ok/hoàn thành…’
+  const stripMentions = (s) => String(s || '').replace(/@\S+/g, '').trim();
+  const stripDoneWords = (s) => String(s || '').replace(DONE_REGEX, '').trim();
+  const core = (s) => norm(stripDoneWords(stripMentions(s)));
 
-    // 1) Ưu tiên match theo message-id của tin bạn reply
-    const quoteId = getQuoteId(data);
-    if (quoteId) {
-      const t = tasks.find(x => !x.done && x.src_msg_id === quoteId);
-      if (t) {
-        t.done = true;
-        t.doneAt = new Date().toISOString();
-        saveTasks(tasks);
-        await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(t)}`);
-        return;
-      }
+  const tasks = loadTasks();
+
+  // 1) Match theo message-id của tin bạn reply
+  const quoteId = getQuoteId(data);
+  if (quoteId) {
+    const t = tasks.find(x => !x.done && x.src_msg_id === quoteId);
+    if (t) {
+      t.done = true;
+      t.doneAt = new Date().toISOString();
+      saveTasks(tasks);
+      await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(t)}`);
+      return;
     }
+  }
 
-    // 2) Nếu không có ID → thử theo nội dung trích dẫn (quoted text)
-    const qText = getQuoteText(data);
-    if (qText) {
-      const nq = norm(qText);
-      const cand = tasks
-        .filter(x => !x.done)
-        .reverse()
-        .find(x => {
-          const nm = norm(x.message);
-          return nm && nq && (nm.includes(nq) || nq.includes(nm));
-        });
+  // 2) Match theo nội dung trích dẫn (quoted text)
+  const qTextRaw = getQuoteText(data);
+  const qText = core(qTextRaw);
+  if (qText) {
+    // So khớp “gần giống” với task chưa xong gần nhất
+    const cand = tasks
+      .filter(x => !x.done)
+      .reverse()
+      .find(x => {
+        const nm = core(x.message);
+        return nm && qText && (nm.includes(qText) || qText.includes(nm));
+      });
 
-      if (cand) {
-        cand.done = true;
-        cand.doneAt = new Date().toISOString();
-        saveTasks(tasks);
-        await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(cand)}`);
-        return;
-      }
+    if (cand) {
+      cand.done = true;
+      cand.doneAt = new Date().toISOString();
+      saveTasks(tasks);
+      await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(cand)}`);
+      return;
     }
+  }
 
-    // 3) Fallback: chốt việc mở gần nhất của chính người nhắn
-    for (let i = tasks.length - 1; i >= 0; i--) {
-      const t = tasks[i];
-      if (!t.done && (t.sender === sender || (t.owner && t.owner.includes('@')))) {
-        t.done = true;
-        t.doneAt = new Date().toISOString();
-        saveTasks(tasks);
-        await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(t)}`);
-        return;
-      }
-    }
-
-    await sendTextToGroup('⚠️ Không có việc nào để đánh dấu xong.');
+  // 3) Fallback: nếu không có task để chốt mà vẫn có quoted text
+  //    → TỰ TẠO TASK từ quoted text rồi đánh dấu hoàn thành ngay
+  if (qTextRaw && qTextRaw.trim().length >= 4) {
+    const t = {
+      id: nextTaskId(tasks),
+      sender,
+      owner: '',
+      message: stripMentions(qTextRaw).trim(),
+      dueAt: null,
+      createdAt: new Date().toISOString(),
+      done: true,
+      doneAt: new Date().toISOString(),
+      // Lưu để lần sau còn map
+      src_msg_id: quoteId || undefined,
+      src_sender: undefined
+    };
+    tasks.push(t);
+    saveTasks(tasks);
+    await sendTextToGroup(`✅ Đã hoàn thành (tạo từ reply): ${renderTask(t)}`);
     return;
   }
+
+  // 4) Fallback cuối: chốt việc mở gần nhất của chính người nhắn
+  for (let i = tasks.length - 1; i >= 0; i--) {
+    const t = tasks[i];
+    if (!t.done && (t.sender === sender || (t.owner && t.owner.includes('@')))) {
+      t.done = true;
+      t.doneAt = new Date().toISOString();
+      saveTasks(tasks);
+      await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(t)}`);
+      return;
+    }
+  }
+
+  await sendTextToGroup('⚠️ Không có việc nào để đánh dấu xong.');
+  return;
+}
 
   // --- Auto-TODO từ tin nhắn thường ---
   if (AUTO_TODO && inGroup && !text.startsWith('/')) {
