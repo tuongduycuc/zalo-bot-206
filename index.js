@@ -1,4 +1,6 @@
-// index.js — Zalo OA Task Bot (v3) — silent confirm + daily report 17:00
+// index.js — Zalo OA Task Bot (v3)
+// - Im lặng khi đánh dấu hoàn thành (DONE_SILENT)
+// - Báo cáo theo lệnh và tự động lúc 17:00
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
@@ -16,8 +18,11 @@ const TZ = process.env.TZ || 'Asia/Ho_Chi_Minh';
 
 const ONLY_ADMINS = String(process.env.ONLY_ADMINS || 'false').toLowerCase() === 'true';
 const ADMIN_UIDS  = (process.env.ADMIN_UIDS || '').split(',').map(s=>s.trim()).filter(Boolean);
+
 const AUTO_TODO   = String(process.env.AUTO_TODO || 'true').toLowerCase() === 'true';
 const AUTO_TODO_CONFIRM = String(process.env.AUTO_TODO_CONFIRM || 'true').toLowerCase() === 'true';
+
+const DONE_SILENT = String(process.env.DONE_SILENT || 'true').toLowerCase() === 'true';
 
 const DAILY_H = Number(process.env.DAILY_REPORT_HOUR || 17);
 const DAILY_M = Number(process.env.DAILY_REPORT_MINUTE || 0);
@@ -39,9 +44,7 @@ function safeRead(path, fallback) {
   try { return fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf8')) : fallback; }
   catch { return fallback; }
 }
-function safeWrite(path, data) {
-  fs.writeFileSync(path, JSON.stringify(data, null, 2));
-}
+function safeWrite(path, data) { fs.writeFileSync(path, JSON.stringify(data, null, 2)); }
 
 function fmt(d) { return new Date(d).toLocaleString('vi-VN', { timeZone: TZ }); }
 function clean(s){ return String(s||'').replace(/\s+/g,' ').trim(); }
@@ -54,25 +57,19 @@ function norm(s){
     .trim();
 }
 
-// Alias lệnh báo cáo
 function isReportCmd(s) {
   const t = norm(s);
   return (
     /^\/report$/i.test(s) ||
     /^\/bc$/i.test(s) ||
-    t === 'bc' ||
-    t === 'bao cao' ||
-    t === 'baocao' ||
-    t === 'bao-cao'
+    t === 'bc' || t === 'bao cao' || t === 'baocao' || t === 'bao-cao'
   );
 }
 
 // ---------- token load/save/refresh ----------
 function loadPersistedToken() {
   const tok = safeRead(TOKEN_FILE, null);
-  if (tok?.access_token) {
-    ACCESS_TOKEN = tok.access_token;
-  }
+  if (tok?.access_token) ACCESS_TOKEN = tok.access_token;
 }
 function persistToken(access_token, expires_in_sec) {
   const expires_at = Date.now() + (Number(expires_in_sec || 3600) - 60) * 1000;
@@ -80,28 +77,19 @@ function persistToken(access_token, expires_in_sec) {
   ACCESS_TOKEN = access_token;
   console.log('🔄 Token refreshed. Expires at:', new Date(expires_at).toISOString());
 }
-
 async function refreshAccessToken() {
-  if (!REFRESH_TOKEN) {
-    console.log('⚠️ REFRESH_TOKEN chưa cấu hình, không thể làm mới access_token.');
-    return false;
-  }
+  if (!REFRESH_TOKEN) { console.log('⚠️ REFRESH_TOKEN chưa cấu hình.'); return false; }
   try {
-    const r = await axios.post(
-      `${API_V3}/oa/access_token`,
+    const r = await axios.post(`${API_V3}/oa/access_token`,
       { refresh_token: REFRESH_TOKEN },
-      { headers: { 'Content-Type': 'application/json' }, validateStatus:()=>true, timeout:10000 }
+      { headers: { 'Content-Type':'application/json' }, validateStatus:()=>true, timeout:10000 }
     );
     if (r.status === 200 && r.data?.access_token) {
       persistToken(r.data.access_token, r.data.expires_in || 3600);
       return true;
     }
-    console.log('❌ refresh token thất bại:', r.status, r.data);
-    return false;
-  } catch (e) {
-    console.log('❌ refresh token error:', e.response?.data || e.message);
-    return false;
-  }
+    console.log('❌ refresh token fail:', r.status, r.data); return false;
+  } catch (e) { console.log('❌ refresh token error:', e.response?.data || e.message); return false; }
 }
 loadPersistedToken();
 
@@ -254,7 +242,8 @@ app.post('/webhook', async (req,res)=>{
     saveMsgs(msgs);
   }
 
-  if(!allow(sender)){ await sendGroup('⛔ Bạn không có quyền dùng lệnh này.'); return; }
+  const allowUser = !ONLY_ADMINS || ADMIN_UIDS.includes(String(sender));
+  if(!allowUser){ await sendGroup('⛔ Bạn không có quyền dùng lệnh này.'); return; }
 
   // commands
   if(/^\/groupid$/i.test(text)){ await sendGroup(GROUP_ID?`GROUP_ID: ${GROUP_ID}`:'Chưa có GROUP_ID.'); return; }
@@ -273,14 +262,17 @@ app.post('/webhook', async (req,res)=>{
     if(m){
       const id = Number(m[1]);
       const t = tasks.find(x=>x.id===id);
-      if(!t) { await sendGroup(`⚠️ Không thấy task #${id}`); return; }
+      if(!t) { if(!DONE_SILENT) await sendGroup(`⚠️ Không thấy task #${id}`); return; }
       t.done=true; t.doneAt=new Date().toISOString(); saveTasks(tasks);
-      await sendGroup(`✅ Đã hoàn thành: ${render(t)}`); return;
+      if(!DONE_SILENT) await sendGroup(`✅ Đã hoàn thành: ${render(t)}`);
+      return;
     }
     for(let i=tasks.length-1;i>=0;i--){
-      if(!tasks[i].done){ tasks[i].done=true; tasks[i].doneAt=new Date().toISOString(); saveTasks(tasks); await sendGroup(`✅ Đã hoàn thành: ${render(tasks[i])}`); return; }
+      if(!tasks[i].done){ tasks[i].done=true; tasks[i].doneAt=new Date().toISOString(); saveTasks(tasks);
+        if(!DONE_SILENT) await sendGroup(`✅ Đã hoàn thành: ${render(tasks[i])}`); return; }
     }
-    await sendGroup('⚠️ Không có việc nào để đánh dấu xong.'); return;
+    if(!DONE_SILENT) await sendGroup('⚠️ Không có việc nào để đánh dấu xong.');
+    return;
   }
 
   // OK/done qua quote
@@ -336,17 +328,20 @@ app.post('/webhook', async (req,res)=>{
 
     if(t){
       t.done = true; t.doneAt = new Date().toISOString(); saveTasks(tasks);
-      await sendGroup(`✅ Đã hoàn thành: ${render(t)}`); return;
+      if(!DONE_SILENT) await sendGroup(`✅ Đã hoàn thành: ${render(t)}`);
+      return;
     }
 
+    // fallback: đánh dấu job gần nhất chưa xong
     for(let i=tasks.length-1;i>=0;i--){
-      if(!tasks[i].done){ tasks[i].done=true; tasks[i].doneAt=new Date().toISOString(); saveTasks(tasks); await sendGroup(`✅ Đã hoàn thành: ${render(tasks[i])}`); return; }
+      if(!tasks[i].done){ tasks[i].done=true; tasks[i].doneAt=new Date().toISOString(); saveTasks(tasks);
+        if(!DONE_SILENT) await sendGroup(`✅ Đã hoàn thành: ${render(tasks[i])}`); return; }
     }
-    await sendGroup('⚠️ Không có việc nào để đánh dấu xong.');
+    if(!DONE_SILENT) await sendGroup('⚠️ Không có việc nào để đánh dấu xong.');
     return;
   }
 
-  // auto create todo (SILENT nếu AUTO_TODO_CONFIRM=false)
+  // auto create todo (SILENT confirm nếu AUTO_TODO_CONFIRM=false)
   if(AUTO_TODO && inGroup && !text.startsWith('/')){
     if(text.length>=2 && text.length<=400){
       const tasks = loadTasks();
@@ -363,17 +358,19 @@ app.post('/webhook', async (req,res)=>{
         src_sender: sender
       };
       tasks.push(t); saveTasks(tasks);
-      if (AUTO_TODO_CONFIRM) {
-        await sendGroup(`📝 Đã ghi nhận việc: ${render(t)}`);
-      }
+      if (AUTO_TODO_CONFIRM) await sendGroup(`📝 Đã ghi nhận việc: ${render(t)}`);
     }
   }
 });
 
-// ---------- daily report 17:00 ----------
+// ---------- daily report ----------
 let lastTick = '';
 setInterval(async ()=>{
-  const { hh, mm } = getHourMinuteTZ();
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false
+  }).formatToParts(new Date());
+  const hh = Number(parts.find(p=>p.type==='hour').value);
+  const mm = Number(parts.find(p=>p.type==='minute').value);
   const key = `${hh}:${mm}`;
   if (hh === DAILY_H && mm === DAILY_M && key !== lastTick) {
     lastTick = key;
