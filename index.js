@@ -1,7 +1,8 @@
 // index.js — Zalo OA Task Bot (v3)
-// - Im lặng khi đánh dấu hoàn thành (DONE_SILENT)
+// - Ghi việc tự động (im lặng), done im lặng
 // - Báo cáo theo lệnh & tự động 17:00
 // - Báo cáo theo khoảng thời gian & xuất Excel (*.xlsx) qua link
+// - Bắt group chắc chắn, tự refresh token khi hết hạn (nếu có)
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
@@ -13,8 +14,9 @@ import XLSX from 'xlsx';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-let ACCESS_TOKEN = process.env.ZALO_OA_ACCESS_TOKEN || process.env.ACCESS_TOKEN || '';
+let ACCESS_TOKEN   = process.env.ZALO_OA_ACCESS_TOKEN || process.env.ACCESS_TOKEN || '';
 const REFRESH_TOKEN = process.env.REFRESH_TOKEN || '';
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/,''); // bỏ dấu / cuối
 
 let GROUP_ID = process.env.GROUP_ID || '';
 const TZ = process.env.TZ || 'Asia/Ho_Chi_Minh';
@@ -23,7 +25,7 @@ const ONLY_ADMINS = String(process.env.ONLY_ADMINS || 'false').toLowerCase() ===
 const ADMIN_UIDS  = (process.env.ADMIN_UIDS || '').split(',').map(s=>s.trim()).filter(Boolean);
 
 const AUTO_TODO   = String(process.env.AUTO_TODO || 'true').toLowerCase() === 'true';
-const AUTO_TODO_CONFIRM = String(process.env.AUTO_TODO_CONFIRM || 'true').toLowerCase() === 'true';
+const AUTO_TODO_CONFIRM = String(process.env.AUTO_TODO_CONFIRM || 'false').toLowerCase() === 'true';
 
 const DONE_SILENT = String(process.env.DONE_SILENT || 'true').toLowerCase() === 'true';
 
@@ -44,14 +46,14 @@ const TOKEN_FILE = './token.json';
 fs.mkdirSync('public/exports', { recursive: true });
 
 app.use(bodyParser.json());
-app.use('/files', express.static('public')); // phục vụ file xuất excel
+app.use('/files', express.static('public')); // phục vụ file xuất excel & last webhook
 
-// ---------- storage ----------
-function safeRead(path, fallback) {
-  try { return fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf8')) : fallback; }
+// ---------------- Storage helpers ----------------
+function safeRead(file, fallback) {
+  try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : fallback; }
   catch { return fallback; }
 }
-function safeWrite(path, data) { fs.writeFileSync(path, JSON.stringify(data, null, 2)); }
+function safeWrite(file, data) { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
 
 function fmt(d) { return new Date(d).toLocaleString('vi-VN', { timeZone: TZ }); }
 function clean(s){ return String(s||'').replace(/\s+/g,' ').trim(); }
@@ -64,6 +66,7 @@ function norm(s){
     .trim();
 }
 
+// Alias báo cáo
 function isReportCmd(s) {
   const t = norm(s);
   return (
@@ -73,7 +76,7 @@ function isReportCmd(s) {
   );
 }
 
-// ---------- token load/save/refresh ----------
+// ---------------- Token load/save/refresh ----------------
 function loadPersistedToken() {
   const tok = safeRead(TOKEN_FILE, null);
   if (tok?.access_token) ACCESS_TOKEN = tok.access_token;
@@ -100,7 +103,7 @@ async function refreshAccessToken() {
 }
 loadPersistedToken();
 
-// ---------- helpers & tasks ----------
+// ---------------- Task helpers ----------------
 function loadTasks(){ return safeRead(TASK_FILE, []); }
 function saveTasks(t){ safeWrite(TASK_FILE, t); }
 function nextTaskId(tasks){ return tasks.reduce((m,t)=>Math.max(m,t.id||0),0)+1; }
@@ -136,7 +139,7 @@ function saveGroupId(id){
 }
 if(!GROUP_ID) GROUP_ID = loadGroupId();
 
-// dedupe
+// Dedupe
 const seen = new Map();
 function remember(id){ const now=Date.now(); if(id) {seen.set(id,now); for(const[k,v] of seen){ if(now-v>10*60*1000) seen.delete(k);} } }
 function isDup(id){ return id && seen.has(id); }
@@ -144,7 +147,7 @@ function isDup(id){ return id && seen.has(id); }
 const isAdmin = uid => ADMIN_UIDS.includes(String(uid));
 const allow   = uid => !ONLY_ADMINS || isAdmin(uid);
 
-// Quote info
+// Quote extractor
 function getQuoteInfo(data){
   const m = data?.message || {};
   const qid =
@@ -161,7 +164,7 @@ function getQuoteInfo(data){
   return { quoteId: qid, quoteText: qtxt, quoteSender: qsender };
 }
 
-// send to group with auto refresh
+// ---------------- Send to group (auto refresh on -216/401) ----------------
 async function zaloGroupMessage(text) {
   return axios.post(
     `${API_V3}/oa/group/message`,
@@ -192,22 +195,14 @@ async function sendGroup(text){
   }
 }
 
-// ====== PARSE TIME RANGE ======
+// ---------------- Time helpers & range parsing ----------------
 function toDate(d) {
-  // Hỗ trợ yyyy-mm-dd, dd/mm/yyyy, dd-mm-yyyy
   if (!d) return null;
   const s = String(d).trim();
-  // yyyy-mm-dd
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return new Date(s + 'T00:00:00');
-  // dd/mm/yyyy hoặc dd-mm-yyyy
   const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-  if (m) {
-    const dd = m[1].padStart(2,'0');
-    const mm = m[2].padStart(2,'0');
-    const yy = m[3];
-    return new Date(`${yy}-${mm}-${dd}T00:00:00`);
-  }
-  return new Date(s); // để JS cố gắng parse
+  if (m) { const dd=m[1].padStart(2,'0'); const mm=m[2].padStart(2,'0'); const yy=m[3]; return new Date(`${yy}-${mm}-${dd}T00:00:00`); }
+  return new Date(s);
 }
 function startOfDay(d){ const x=new Date(d); x.setHours(0,0,0,0); return x; }
 function endOfDay(d){ const x=new Date(d); x.setHours(23,59,59,999); return x; }
@@ -217,17 +212,15 @@ function resolveShortcut(token) {
   const now = new Date();
   const todayS = startOfDay(now);
   const yesterdayS = addDays(todayS, -1);
-  if (token === 'today')   return { from: todayS, to: endOfDay(todayS) };
+  if (token === 'today')     return { from: todayS, to: endOfDay(todayS) };
   if (token === 'yesterday') return { from: yesterdayS, to: endOfDay(yesterdayS) };
 
-  // thisweek / lastweek (Mon–Sun)
-  const dow = todayS.getDay() || 7; // 1..7 (Mon..Sun)
+  const dow = todayS.getDay() || 7; // Mon=1..Sun=7
   const weekStart = addDays(todayS, 1 - dow);
   const lastWeekStart = addDays(weekStart, -7);
   if (token === 'thisweek') return { from: weekStart, to: endOfDay(addDays(weekStart, 6)) };
   if (token === 'lastweek') return { from: lastWeekStart, to: endOfDay(addDays(lastWeekStart, 6)) };
 
-  // thismonth / lastmonth
   const m0 = new Date(todayS.getFullYear(), todayS.getMonth(), 1);
   const m1 = new Date(todayS.getFullYear(), todayS.getMonth()+1, 0);
   const lm0 = new Date(todayS.getFullYear(), todayS.getMonth()-1, 1);
@@ -239,7 +232,6 @@ function resolveShortcut(token) {
 }
 
 function parseRange(args) {
-  // args: [from, to] hoặc [shortcut] hoặc ['done', from, to] …
   let target = 'createdAt'; // mặc định lọc theo ngày tạo
   let i = 0;
   if (String(args[0]||'').toLowerCase() === 'done') { target = 'doneAt'; i = 1; }
@@ -247,26 +239,18 @@ function parseRange(args) {
   let from=null, to=null;
   const token = String(args[i]||'').toLowerCase();
 
-  // shortcut
   const sc = resolveShortcut(token);
   if (sc) { from = sc.from; to = sc.to; return { target, from, to }; }
 
-  // 2 mốc ngày
   if (args[i] && args[i+1]) {
     const f = toDate(args[i]);
     const t = toDate(args[i+1]);
-    if (f && t && !isNaN(f) && !isNaN(t)) {
-      from = startOfDay(f);
-      to   = endOfDay(t);
-      return { target, from, to };
-    }
+    if (f && t && !isNaN(f) && !isNaN(t)) { return { target, from:startOfDay(f), to:endOfDay(t) }; }
   }
-  // 1 mốc (coi như 1 ngày)
   if (args[i]) {
     const f = toDate(args[i]);
-    if (f && !isNaN(f)) { from = startOfDay(f); to = endOfDay(f); return { target, from, to }; }
+    if (f && !isNaN(f)) { return { target, from:startOfDay(f), to:endOfDay(f) }; }
   }
-
   return null;
 }
 
@@ -281,7 +265,7 @@ function filterByRange(tasks, range) {
   });
 }
 
-// ====== EXPORT EXCEL ======
+// ---------------- Export Excel ----------------
 function exportExcel(tasks, filename) {
   const rows = tasks.map(t => ({
     id: t.id,
@@ -300,7 +284,7 @@ function exportExcel(tasks, filename) {
   XLSX.writeFile(wb, filename);
 }
 
-// time helper in TZ
+// Hour/minute in TZ
 function getHourMinuteTZ() {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false
@@ -310,39 +294,53 @@ function getHourMinuteTZ() {
   return { hh, mm };
 }
 
-// ---------- routes ----------
+// ---------------- Routes ----------------
 app.get('/', (req,res)=>{
   res.send(`<h3>💧 Zalo Task Bot (v3)</h3>
 <div>GROUP_ID: ${GROUP_ID||'(none)'} —
 <a href="/health">health</a> —
-<a href="/debug/last">last</a> —
+<a href="/files/last_webhook.json">last</a> —
 <a href="/report-now">report-now</a></div>`);
 });
 app.get('/health', (req,res)=>res.json({ok:true, group_id:!!GROUP_ID}));
-app.get('/debug/last', (req,res)=>{ try{res.type('json').send(fs.readFileSync(LAST_FILE,'utf8'))}catch{res.status(404).send('no payload')}});
-app.get('/set-group', (req,res)=>{ const id=String(req.query.id||'').trim(); if(!id) return res.status(400).send('missing ?id'); saveGroupId(id); res.send('OK '+id); });
 app.get('/report-now', async (req,res)=>{ await sendGroup(report(loadTasks())); res.send('OK'); });
+app.get('/set-group', (req,res)=>{ const id=String(req.query.id||'').trim(); if(!id) return res.status(400).send('missing ?id'); saveGroupId(id); res.send('OK '+id); });
 
-// ---------- webhook ----------
+// ---------------- Webhook ----------------
 app.post('/webhook', async (req,res)=>{
   const data = req.body || {};
   res.status(200).send('OK');
-  try{ fs.mkdirSync('./public',{recursive:true}); fs.writeFileSync(LAST_FILE, JSON.stringify(data,null,2)); }catch{}
+  try { fs.mkdirSync('./public',{recursive:true}); fs.writeFileSync(LAST_FILE, JSON.stringify(data,null,2)); } catch {}
 
   const ev     = data.event_name || '';
   const msgId  = data?.message?.msg_id || data?.msg_id || '';
   const sender = data?.sender?.id || 'unknown';
   const text0  = data?.message?.text;
 
-  const detectedGid = data?.recipient?.group_id || data?.message?.conversation_id || data?.conversation?.id || '';
+  // Phát hiện group id từ nhiều trường
+  const detectedGid =
+    data?.recipient?.group_id ||
+    data?.message?.conversation_id ||
+    data?.conversation?.id ||
+    data?.message?.group_id ||
+    '';
+
+  // Lưu GROUP_ID nếu chưa có
   if(detectedGid && !GROUP_ID) saveGroupId(detectedGid);
 
-  const inGroup =
-    !!(data?.recipient?.group_id ||
-       data?.message?.conversation_id ||
-       data?.conversation?.id ||
-       (data?.recipient?.id && GROUP_ID && data.recipient.id===GROUP_ID)) ||
-    /group/.test(ev);
+  // Bắt group chắc chắn
+  const evLower = String(ev || '').toLowerCase();
+  const looksGroup =
+    !!detectedGid ||
+    !!data?.recipient?.group_id ||
+    !!data?.message?.conversation_id ||
+    !!data?.message?.group_id ||
+    !!data?.conversation?.id;
+  const isGroupEvent =
+    /group/.test(evLower) ||
+    /user_send_group_text/.test(evLower) ||
+    /oa_send_to_group/.test(evLower);
+  const inGroup = looksGroup || isGroupEvent;
 
   console.log('📩 webhook', { ev, sender, msgId, detectedGid, inGroup, text: text0 });
 
@@ -351,44 +349,37 @@ app.post('/webhook', async (req,res)=>{
   const text = clean(text0);
   if(!text) return;
 
+  // Cache message để có thể JIT tạo task khi reply "ok"
   if(inGroup && msgId){
     const msgs = loadMsgs();
     msgs.unshift({ msg_id: msgId, text, sender, timestamp: Date.now() });
     saveMsgs(msgs);
   }
 
-  const allowUser = !ONLY_ADMINS || ADMIN_UIDS.includes(String(sender));
-  if(!allowUser){ await sendGroup('⛔ Bạn không có quyền dùng lệnh này.'); return; }
+  if(!allow(sender)){ await sendGroup('⛔ Bạn không có quyền dùng lệnh này.'); return; }
 
-  // commands
+  // ----- Commands -----
   if(/^\/groupid$/i.test(text)){ await sendGroup(GROUP_ID?`GROUP_ID: ${GROUP_ID}`:'Chưa có GROUP_ID.'); return; }
 
-  // --------- REPORT / EXPORT with time range ----------
-  // /report [done] <from> <to> | /report thisweek | ...
-  // /export [done] <from> <to> | /export lastmonth | ...
+  // REPORT/EXPORT với khoảng thời gian
   if (/^\/(report|bc)\b/i.test(text) || /^\/export\b/i.test(text)) {
-    const parts = text.split(/\s+/).slice(1); // after command
+    const parts = text.split(/\s+/).slice(1);
     const cmd = text.toLowerCase().startsWith('/export') ? 'export' : 'report';
     const range = parseRange(parts);
 
     const tasks = loadTasks();
-    let filtered = tasks;
-
-    if (range) {
-      filtered = filterByRange(tasks, range);
-    }
+    const filtered = range ? filterByRange(tasks, range) : tasks;
 
     if (cmd === 'report') {
-      const msg = (range
+      const header = range
         ? `📅 Báo cáo (${range.target === 'doneAt' ? 'hoàn thành' : 'tạo'}) từ ${fmt(range.from)} đến ${fmt(range.to)}\n\n`
-        : '') + (() => {
-          const done = filtered.filter(x=>x.done);
-          const pend = filtered.filter(x=>!x.done);
-          let s = '';
-          s += '✅ ĐÃ HOÀN THÀNH:\n' + (done.length?done.map(render).join('\n'):'• Không có') + '\n\n';
-          s += '⚠️ CHƯA HOÀN THÀNH:\n' + (pend.length?pend.map(render).join('\n'):'• Không có');
-          return s;
-        })();
+        : '';
+      const done = filtered.filter(x=>x.done);
+      const pend = filtered.filter(x=>!x.done);
+      const msg =
+        header +
+        '✅ ĐÃ HOÀN THÀNH:\n' + (done.length?done.map(render).join('\n'):'• Không có') + '\n\n' +
+        '⚠️ CHƯA HOÀN THÀNH:\n' + (pend.length?pend.map(render).join('\n'):'• Không có');
       await sendGroup(msg);
       return;
     }
@@ -400,11 +391,16 @@ app.post('/webhook', async (req,res)=>{
         : `report_${stamp.getFullYear()}${String(stamp.getMonth()+1).padStart(2,'0')}${String(stamp.getDate()).padStart(2,'0')}_${String(stamp.getHours()).padStart(2,'0')}${String(stamp.getMinutes()).padStart(2,'0')}.xlsx`;
       const filePath = path.join('public/exports', name);
       exportExcel(filtered, filePath);
-      await sendGroup(`📦 Đã tạo file: https://${process.env.RENDER_EXTERNAL_URL || req?.headers?.host || 'your-host'}/files/exports/${encodeURIComponent(name)}`);
+
+      // sinh link tải ổn định
+      const base = PUBLIC_BASE_URL || `https://${process.env.RENDER_EXTERNAL_URL || req?.headers?.host || 'localhost:'+PORT}`.replace(/\/+$/,'');
+      const url  = `${base}/files/exports/${encodeURIComponent(name)}`;
+      await sendGroup(`📦 Đã tạo file: ${url}`);
       return;
     }
   }
 
+  // alias báo cáo ngắn
   if (isReportCmd(text)) { await sendGroup(report(loadTasks())); return; }
 
   if(/^\/list$/i.test(text)){
@@ -413,6 +409,7 @@ app.post('/webhook', async (req,res)=>{
     await sendGroup('📋 Danh sách:\n'+tasks.slice(-20).map(render).join('\n')); return;
   }
 
+  // /done hoặc /done <id>
   if(/^\/done(\s+\d+)?$/i.test(text)){
     const tasks = loadTasks();
     const m = text.match(/\/done\s+(\d+)/i);
@@ -432,7 +429,7 @@ app.post('/webhook', async (req,res)=>{
     return;
   }
 
-  // OK/done qua quote
+  // Nhắn "ok/đã xử lý/..." với quote để đánh dấu hoàn thành
   if(DONE_REGEX.test(text)){
     const tasks = loadTasks();
     const {quoteId, quoteText, quoteSender} = getQuoteInfo(data);
@@ -489,38 +486,44 @@ app.post('/webhook', async (req,res)=>{
       return;
     }
 
-    // fallback: đánh dấu job gần nhất chưa xong
     for(let i=tasks.length-1;i>=0;i--){
-      if(!tasks[i].done){ tasks[i].done=true; tasks[i].doneAt=new Date().toISOString(); saveTasks(tasks);
-        if(!DONE_SILENT) await sendGroup(`✅ Đã hoàn thành: ${render(tasks[i])}`); return; }
+      if(!tasks[i].done){ tasks[i].done=true; t=tasks[i]; t.doneAt=new Date().toISOString(); saveTasks(tasks);
+        if(!DONE_SILENT) await sendGroup(`✅ Đã hoàn thành: ${render(t)}`); return; }
     }
     if(!DONE_SILENT) await sendGroup('⚠️ Không có việc nào để đánh dấu xong.');
     return;
   }
 
-  // auto create todo
-  if(AUTO_TODO && inGroup && !text.startsWith('/')){
-    if(text.length>=2 && text.length<=400){
+  // --------- AUTO_TODO: ghi nhận công việc (im lặng) ---------
+  if (AUTO_TODO && inGroup && !text.startsWith('/')) {
+    const content = clean(text);
+    if (content.length >= 1 && content.length <= 500) {
       const tasks = loadTasks();
       const t = {
         id: nextTaskId(tasks),
         sender,
         owner: '',
-        message: text,
+        message: content,
         dueAt: null,
         createdAt: new Date().toISOString(),
         done: false,
         doneAt: null,
-        src_msg_id: msgId,
+        src_msg_id: msgId || '',
         src_sender: sender
       };
       tasks.push(t); saveTasks(tasks);
-      if (AUTO_TODO_CONFIRM) await sendGroup(`📝 Đã ghi nhận việc: ${render(t)}`);
+      console.log('📝 AUTO_TODO captured:', { id: t.id, message: t.message });
+
+      if (AUTO_TODO_CONFIRM) {
+        await sendGroup(`📝 Đã ghi nhận việc: ${render(t)}`);
+      }
+    } else {
+      console.log('ℹ️ AUTO_TODO skipped (length):', content.length);
     }
   }
 });
 
-// ---------- daily report ----------
+// ---------------- Daily report (17:00 theo TZ) ----------------
 let lastTick = '';
 setInterval(async ()=>{
   const parts = new Intl.DateTimeFormat('en-GB', {
@@ -535,7 +538,7 @@ setInterval(async ()=>{
   }
 }, 60 * 1000);
 
-// ---------- start ----------
+// ---------------- Start ----------------
 app.listen(PORT, ()=>{
   console.log(`🚀 Server on :${PORT}`);
   if(!ACCESS_TOKEN) console.log('⚠️ Missing ZALO_OA_ACCESS_TOKEN/ACCESS_TOKEN');
