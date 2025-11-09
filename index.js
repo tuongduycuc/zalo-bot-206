@@ -17,10 +17,10 @@ const ACCESS_TOKEN =
 let GROUP_ID = process.env.GROUP_ID || '';
 const ADMIN_UIDS = (process.env.ADMIN_UIDS || '').split(',').map(s=>s.trim()).filter(Boolean);
 
+// ==== Files ====
 const TASK_FILE  = './tasks.json';
 const GROUP_FILE = './group.json';
 const LAST_FILE  = './public/last_webhook.json';
-
 const API_V3 = 'https://openapi.zalo.me/v3.0';
 
 app.use(bodyParser.json());
@@ -48,16 +48,14 @@ const VN_TZ = 'Asia/Ho_Chi_Minh';
 const fmtDate = (d) => new Date(d).toLocaleString('vi-VN', { timeZone: VN_TZ });
 
 function parseDue(input){
-  // chấp nhận "dd/mm/yyyy hh:mm" hoặc "dd/mm hh:mm" (năm = năm hiện tại), hoặc chỉ "dd/mm"
   if (!input) return null;
   const s = input.trim();
-  // dd/mm/yyyy hh:mm
+
   let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})$/);
   if (m) {
     const [_, dd, mm, yyyy, hh, mi] = m.map(Number);
-    return new Date(Date.UTC(yyyy, mm-1, dd, hh-7, mi)).toISOString();
+    return new Date(Date.UTC(yyyy, mm-1, dd, hh-7, mi)).toISOString(); // VN-7
   }
-  // dd/mm hh:mm (năm hiện tại)
   m = s.match(/^(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})$/);
   if (m) {
     const now = new Date();
@@ -65,13 +63,12 @@ function parseDue(input){
     const [_, dd, mm, hh, mi] = m.map(Number);
     return new Date(Date.UTC(yyyy, mm-1, dd, hh-7, mi)).toISOString();
   }
-  // dd/mm (set 17:00)
   m = s.match(/^(\d{1,2})\/(\d{1,2})$/);
   if (m) {
     const now = new Date();
     const yyyy = now.getUTCFullYear();
     const [_, dd, mm] = m.map(Number);
-    return new Date(Date.UTC(yyyy, mm-1, dd, 10, 0)).toISOString(); // 17:00 VN = 10:00 UTC
+    return new Date(Date.UTC(yyyy, mm-1, dd, 10, 0)).toISOString(); // 17:00 VN
   }
   return null;
 }
@@ -81,17 +78,14 @@ function nextTaskId(tasks){
   return max + 1;
 }
 
-// ==== Senders (V3 đúng schema) ====
+// ==== Senders (V3) ====
 async function sendTextToGroup(text){
   if (!GROUP_ID) return console.log('⚠️ Chưa có GROUP_ID.');
   if (!ACCESS_TOKEN) return console.log('⚠️ Thiếu ACCESS_TOKEN.');
   try {
     const r = await axios.post(
       `${API_V3}/oa/group/message`,
-      {
-        recipient: { group_id: GROUP_ID },
-        message:   { text: String(text) }
-      },
+      { recipient: { group_id: GROUP_ID }, message: { text: String(text) } },
       {
         headers: {
           'Content-Type': 'application/json',
@@ -112,16 +106,12 @@ async function sendTextToGroup(text){
     console.error('❌ Lỗi group/message:', e.response?.data || e.message);
   }
 }
-
 async function sendTextToUser(user_id, text){
   if (!ACCESS_TOKEN) return console.log('⚠️ Thiếu ACCESS_TOKEN.');
   try {
     const r = await axios.post(
       `${API_V3}/oa/message`,
-      {
-        recipient: { user_id },
-        message:   { text: String(text) }
-      },
+      { recipient: { user_id }, message: { text: String(text) } },
       {
         headers: {
           'Content-Type': 'application/json',
@@ -145,7 +135,6 @@ function renderTaskLine(t){
   const st  = t.done ? `✅ (xong ${fmtDate(t.doneAt)})` : '⏳';
   return `#${t.id} ${st} ${t.message}${who}${due}`;
 }
-
 function reportText(tasks){
   const done    = tasks.filter(t=>t.done);
   const pending = tasks.filter(t=>!t.done);
@@ -154,23 +143,20 @@ function reportText(tasks){
   msg += '⚠️ CHƯA HOÀN THÀNH:\n' + (pending.length ? pending.map(renderTaskLine).join('\n') : '• Không có');
   return msg;
 }
-
-// parse: "/todo nội dung | @nguoiphutrach | 10/11/2025 09:30"
+// "/todo nội dung | @user | 10/11/2025 09:30"
 function parseTodoCommand(text){
-  // cắt "/todo " và chia theo "|"
   const raw = text.replace(/^\/todo\s*/i,'');
   const parts = raw.split('|').map(s=>s.trim()).filter(Boolean);
   const item = { message:'', owner:'', dueAt:null };
   if (!parts.length) return null;
   item.message = parts[0];
-
   for (let i=1;i<parts.length;i++){
     const p = parts[i];
     if (p.startsWith('@')) item.owner = p;
     else {
       const d = parseDue(p);
       if (d) item.dueAt = d;
-      else item.message += ' | ' + p; // ghép thêm nếu không nhận diện được
+      else item.message += ' | ' + p;
     }
   }
   return item;
@@ -184,7 +170,7 @@ app.post('/webhook', async (req,res)=>{
 
   try { fs.writeFileSync(LAST_FILE, JSON.stringify(data,null,2)); } catch {}
 
-  // học group id
+  // nhận group id
   const detectedGroupId =
     data?.recipient?.group_id ||
     data?.message?.conversation_id ||
@@ -193,14 +179,23 @@ app.post('/webhook', async (req,res)=>{
   if (detectedGroupId && !GROUP_ID) saveGroupId(detectedGroupId);
 
   const ev = data.event_name || '';
+  const isText  = !!(data?.message && typeof data.message.text === 'string');
+  const isGroup = !!(data?.recipient?.group_id || data?.conversation?.id || data?.message?.conversation_id);
 
-  // chỉ xử lý text trong nhóm hoặc text từ user
-  if (ev === 'user_send_text' || ev === 'group.message') {
+  // Bắt nhiều biến thể + fallback khi là tin nhắn text trong nhóm
+  if (
+    isText &&
+    (ev === 'user_send_text' ||
+     ev === 'group.message' ||
+     ev === 'group_send_text' ||
+     ev === 'group_user_send_text' ||
+     isGroup)
+  ) {
     const sender = data.sender?.id || 'unknown';
     const text = (data.message?.text || '').trim();
     if (!text) return;
 
-    // ---- COMMANDS ----
+    // ==== COMMANDS ====
     if (/^\/help$/i.test(text)) {
       await sendTextToGroup(
 `🤖 Lệnh hỗ trợ:
@@ -219,8 +214,8 @@ Ví dụ: /todo Sửa rò rỉ D90 | @Toan | 12/11/2025 09:30`
       const tasks = loadTasks();
       const t = {
         id: nextTaskId(tasks),
-        sender, // user_id tạo
-        owner: info.owner || '', // gõ @user nếu muốn
+        sender,
+        owner: info.owner || '',
         message: info.message,
         dueAt: info.dueAt,
         createdAt: new Date().toISOString(),
@@ -240,12 +235,9 @@ Ví dụ: /todo Sửa rò rỉ D90 | @Toan | 12/11/2025 09:30`
       if (arg === 'done') list = tasks.filter(t=>t.done);
       else if (arg === 'me') list = tasks.filter(t=>t.owner || t.sender === sender);
       else if (arg === 'all' || arg==='') list = tasks.filter(()=>true);
-      else list = tasks.filter(t=>!t.done); // mặc định pending
-
+      else list = tasks.filter(t=>!t.done);
       if (!list.length){ await sendTextToGroup('📭 Không có việc phù hợp.'); return; }
-
-      const chunk = list.slice(-15); // giới hạn tránh quá dài
-      await sendTextToGroup('📋 Danh sách:\n' + chunk.map(renderTaskLine).join('\n'));
+      await sendTextToGroup('📋 Danh sách:\n' + list.slice(-15).map(renderTaskLine).join('\n'));
       return;
     }
 
@@ -261,7 +253,6 @@ Ví dụ: /todo Sửa rò rỉ D90 | @Toan | 12/11/2025 09:30`
         await sendTextToGroup(`✅ Đã hoàn thành: ${renderTaskLine(t)}`);
         return;
       } else {
-        // không id: lấy việc gần nhất của người này chưa done
         for (let i=tasks.length-1; i>=0; i--){
           const t = tasks[i];
           if (!t.done && (t.sender===sender || (t.owner && t.owner.includes('@')))) {
@@ -282,16 +273,15 @@ Ví dụ: /todo Sửa rò rỉ D90 | @Toan | 12/11/2025 09:30`
       return;
     }
 
-    // ---- Không phải command: ghi log công việc nhẹ (tuỳ chọn) ----
-    // Bỏ qua: chỉ dùng /todo để tạo việc chuẩn
+    // Không phải command: bỏ qua (chỉ dùng /todo để tạo việc)
   }
 });
 
-// ==== Tools / Pages ====
+// ==== ROUTES ====
 app.get('/', (req,res)=>{
   res.send(`<h2>💧 Zalo Task Bot (OA API v3)</h2>
   <p>GROUP_ID: ${GROUP_ID || '(chưa có)'} — <a href="/health">health</a> — <a href="/debug/last">last</a></p>
-  <p>Commands: /help, /todo, /list, /done, /report</p>`);
+  <p>Commands: /help, /todo, /list, /done, /report — <a href="/report-now">report-now</a></p>`);
 });
 app.get('/health', (req,res)=> res.json({ ok:true, group_id: !!GROUP_ID }));
 app.get('/__selftest', (req,res)=> res.json({ up:true, t:Date.now() }));
@@ -323,7 +313,14 @@ app.get('/send2-user', async (req,res)=>{
   res.send('Đã gọi gửi 1–1.');
 });
 
-// ==== TOKEN CHECK: 6 tries (V3/V2/root) ====
+// 👉 Gửi báo cáo ngay lập tức (không cần gõ trong nhóm)
+app.get('/report-now', async (req, res) => {
+  const tasks = loadTasks();
+  await sendTextToGroup(reportText(tasks));
+  res.send('OK, đã gửi báo cáo vào nhóm.');
+});
+
+// ==== TOKEN CHECK (thử nhiều biến thể endpoint) ====
 app.get('/token-check', async (req, res) => {
   const token = ACCESS_TOKEN;
   if (!token) return res.status(400).json({ error: 'no_token', message: 'Thiếu ACCESS_TOKEN trong ENV' });
@@ -357,7 +354,7 @@ app.get('/token-check', async (req, res) => {
   }
   return res.status(404).json({
     error: 404,
-    message: 'All variants returned 404 (empty/invalid api). Hãy kiểm tra deploy (clear cache), domain và token.'
+    message: 'All variants returned 404 (empty/invalid api). Kiểm tra deploy (clear cache), domain & token.'
   });
 });
 
