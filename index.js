@@ -161,7 +161,7 @@ function reportText(tasks) {
   const pending = tasks.filter(t => !t.done);
   let msg = `📅 Báo cáo ${fmt(new Date())}\n\n`;
   msg += '✅ ĐÃ HOÀN THÀNH:\n' + (done.length ? done.map(renderTask).join('\n') : '• Không có') + '\n\n';
-  msg += '⚠️ CHƢA HOÀN THÀNH:\n' + (pending.length ? pending.map(renderTask).join('\n') : '• Không có');
+  msg += '⚠️ CHƯA HOÀN THÀNH:\n' + (pending.length ? pending.map(renderTask).join('\n') : '• Không có');
   return msg;
 }
 function parseDue(s) {
@@ -346,23 +346,25 @@ Có thể reply “ok/hoàn thành/đã xong” vào tin gốc để chốt vi�
     return;
   }
 
-  // ===== Natural language DONE =====
+  // ===== Natural language DONE (v3.2: 3 lớp dự phòng) =====
   if (DONE_REGEX.test(text)) {
     const tasks = loadTasks();
     const { quoteId, quoteText, quoteSender } = getQuoteInfo(data);
+    const gid = detectedGroupId || GROUP_ID;
 
-    // 1) Có quote: tìm theo msg_id → text → fuzzy
+    // === CANDIDATE 1: từ quote (chuẩn nhất)
+    let candidate = null;
     if (quoteId || quoteText) {
-      let t = tasks.find(x => !x.done && x.src_msg_id === quoteId);
-      if (!t && quoteText) {
-        t = tasks.find(x => !x.done &&
-          (x.norm === normalizeForMatch(quoteText) ||
-           cleanText(x.message) === cleanText(quoteText) ||
-           fuzzyMatch(x.message, quoteText)));
-      }
-      if (!t && quoteText) {
-        // nếu chưa từng ghi task → tạo from quote rồi chốt
-        t = {
+      candidate =
+        tasks.find(x => !x.done && x.src_msg_id && x.src_msg_id === quoteId) ||
+        tasks.find(x => !x.done && quoteText && (
+          x.norm === normalizeForMatch(quoteText) ||
+          cleanText(x.message) === cleanText(quoteText) ||
+          fuzzyMatch(x.message, quoteText)
+        ));
+      // Nếu chưa hề có task nhưng có quoteText -> tạo JIT
+      if (!candidate && quoteText) {
+        candidate = {
           id: nextTaskId(tasks),
           sender: quoteSender || sender,
           owner: '',
@@ -374,58 +376,65 @@ Có thể reply “ok/hoàn thành/đã xong” vào tin gốc để chốt vi�
           src_msg_id: quoteId || '',
           src_sender: quoteSender || sender
         };
-        tasks.push(t);
-      }
-      if (t) {
-        if (t.done) {
-          await sendTextToGroup(`ℹ️ Việc này đã xong trước đó: ${renderTask(t)}`);
-          return;
-        }
-        t.done = true; t.doneAt = new Date().toISOString(); saveTasks(tasks);
-        await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(t)}`);
-        return;
+        tasks.push(candidate);
+        saveTasks(tasks);
       }
     }
 
-    // 2) KHÔNG có quote: lấy tin gần nhất của chính user trong 15'
-    const latest = findRecentUserMessage(sender, detectedGroupId || GROUP_ID);
-    if (latest) {
-      // thử tìm task đã có (nếu AUTO_TODO đã tạo)
-      let t = tasks.find(x => !x.done &&
-        (x.src_msg_id === latest.msg_id ||
-         x.norm === normalizeForMatch(latest.text) ||
-         fuzzyMatch(x.message, latest.text)));
-      if (!t) {
-        // tạo JIT rồi chốt
-        t = {
-          id: nextTaskId(tasks),
-          sender,
-          owner: '',
-          message: latest.text,
-          norm: normalizeForMatch(latest.text),
-          dueAt: null,
-          createdAt: new Date().toISOString(),
-          done: false, doneAt: null,
-          src_msg_id: latest.msg_id,
-          src_sender: sender
-        };
-        tasks.push(t);
+    // === CANDIDATE 2: không có quote -> lấy tin gần nhất của CHÍNH user trong 15'
+    if (!candidate) {
+      const inboxHit = findRecentUserMessage(sender, gid);
+      if (inboxHit) {
+        candidate =
+          tasks.find(x => !x.done && (
+            x.src_msg_id === inboxHit.msg_id ||
+            x.norm === normalizeForMatch(inboxHit.text) ||
+            fuzzyMatch(x.message, inboxHit.text)
+          ));
+        // Nếu vẫn không có -> tạo JIT từ inbox rồi chốt
+        if (!candidate) {
+          candidate = {
+            id: nextTaskId(tasks),
+            sender,
+            owner: '',
+            message: inboxHit.text,
+            norm: normalizeForMatch(inboxHit.text),
+            dueAt: null,
+            createdAt: new Date().toISOString(),
+            done: false, doneAt: null,
+            src_msg_id: inboxHit.msg_id,
+            src_sender: sender
+          };
+          tasks.push(candidate);
+          saveTasks(tasks);
+        }
       }
-      t.done = true; t.doneAt = new Date().toISOString(); saveTasks(tasks);
-      await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(t)}`);
+    }
+
+    // === CANDIDATE 3: fallback “việc mở gần nhất trong nhóm”
+    if (!candidate) {
+      candidate = [...tasks]
+        .reverse()
+        .find(x =>
+          !x.done &&
+          (x.sender === sender || (x.owner && x.owner.includes('@')) || true)
+        );
+    }
+
+    if (!candidate) {
+      await sendTextToGroup('⚠️ Không có việc nào để đánh dấu xong (không tìm thấy ứng viên). Thử /list hoặc tạo việc mới rồi “ok”.');
       return;
     }
 
-    // 3) Fallback cuối: chốt việc gần nhất của user
-    for (let i = tasks.length - 1; i >= 0; i--) {
-      const t = tasks[i];
-      if (!t.done && (t.sender === sender || (t.owner && t.owner.includes('@')))) {
-        t.done = true; t.doneAt = new Date().toISOString(); saveTasks(tasks);
-        await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(t)}`);
-        return;
-      }
+    if (candidate.done) {
+      await sendTextToGroup(`ℹ️ Việc này đã xong trước đó: ${renderTask(candidate)}`);
+      return;
     }
-    await sendTextToGroup('⚠️ Không có việc nào để đánh dấu xong.');
+
+    candidate.done = true;
+    candidate.doneAt = new Date().toISOString();
+    saveTasks(tasks);
+    await sendTextToGroup(`✅ Đã hoàn thành: ${renderTask(candidate)}`);
     return;
   }
 
@@ -460,7 +469,7 @@ app.get('/', (req, res) => {
   res.send(`<h3>💧 Zalo Task Bot (v3)</h3>
   <div>GROUP_ID: ${GROUP_ID || '(none)'} —
   <a href="/health">health</a> — <a href="/debug/last">last</a> —
-  <a href="/report-now">report-now</a></div>`);
+  <a href="/report-now">report-now</a> — <a href="/debug/tasks">debug/tasks</a> — <a href="/debug/inbox">debug/inbox</a></div>`);
 });
 app.get('/health', (req, res) => res.json({ ok: true, group_id: !!GROUP_ID }));
 app.get('/debug/last', (req, res) => { try { res.type('application/json').send(fs.readFileSync(LAST_FILE, 'utf8')); } catch { res.status(404).send('no payload'); }});
@@ -468,6 +477,26 @@ app.get('/set-group', (req, res) => { const id = String(req.query.id || '').trim
 app.get('/send', async (req, res) => { const text = String(req.query.text || '').trim(); if (!text) return res.status(400).send('missing ?text'); await sendTextToGroup(text); res.send('sent'); });
 app.get('/send2-user', async (req, res) => { const uid = String(req.query.uid || '').trim(); const text = String(req.query.text || 'hi').trim(); if (!uid) return res.status(400).send('missing ?uid'); await sendTextToUser(uid, text); res.send('sent'); });
 app.get('/report-now', async (req, res) => { const tasks = loadTasks(); await sendTextToGroup(reportText(tasks)); res.send('OK, báo cáo đã gửi vào nhóm.'); });
+
+// Soi nhanh tasks (20 mục cuối)
+app.get('/debug/tasks', (req, res) => {
+  try {
+    const tasks = loadTasks();
+    res.type('application/json').send(JSON.stringify(tasks.slice(-20), null, 2));
+  } catch (e) {
+    res.status(500).send('tasks error');
+  }
+});
+
+// Soi nhanh inbox (30 tin cuối)
+app.get('/debug/inbox', (req, res) => {
+  try {
+    const inbox = loadInbox();
+    res.type('application/json').send(JSON.stringify(inbox.slice(-30), null, 2));
+  } catch (e) {
+    res.status(404).send('no inbox');
+  }
+});
 
 // Token check (đa biến thể)
 app.get('/token-check', async (req, res) => {
