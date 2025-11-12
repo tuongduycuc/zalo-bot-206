@@ -1,4 +1,4 @@
-// index.js — Zalo OA Group Bot (v3) — full, ready to use
+// index.js — Zalo OA Group Bot (v3) — full, ready to use (fixed group/message endpoint)
 import express from "express";
 import bodyParser from "body-parser";
 import axios from "axios";
@@ -13,6 +13,8 @@ const OA_TOKEN  = process.env.ZALO_OA_ACCESS_TOKEN || process.env.ACCESS_TOKEN |
 let   GROUP_ID  = process.env.GROUP_ID || "";
 const PORT = Number(process.env.PORT || 3000);
 const TZ = process.env.TZ || "Asia/Bangkok";
+
+const API_V3 = "https://openapi.zalo.me/v3.0";
 
 // ====== FILES ======
 const TASK_FILE  = "./tasks.json";
@@ -75,18 +77,33 @@ function extractFirstMentionName(text) {
   return name.length > 50 ? name.slice(0, 50).trim() : name;
 }
 
-// ====== ZALO SEND (v3) ======
+// ====== ZALO SEND (v3) — đúng endpoint: oa/group/message ======
+async function zaloGroupMessage(text) {
+  return axios.post(
+    `${API_V3}/oa/group/message`,
+    { recipient: { group_id: GROUP_ID }, message: { text: String(text) } },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        access_token: OA_TOKEN,
+        Authorization: `Bearer ${OA_TOKEN}`
+      },
+      validateStatus: () => true,
+      timeout: 10000
+    }
+  );
+}
 async function sendGroup(text) {
   if (!GROUP_ID) { console.log("⚠️ No GROUP_ID; cannot send."); return; }
-  try {
-    const r = await axios.post(
-      "https://openapi.zalo.me/v3.0/oa/message/callback",
-      { recipient: { group_id: GROUP_ID }, message: { text: text } },
-      { headers: { access_token: OA_TOKEN, "Content-Type": "application/json" } }
-    );
-    if (r?.data?.error !== 0) console.log("❌ Zalo send error:", r.data);
-  } catch (e) {
-    console.log("❌ Zalo send exception:", e.response?.data || e.message);
+  if (!OA_TOKEN) { console.log("⚠️ Missing ZALO_OA_ACCESS_TOKEN"); return; }
+
+  const r = await zaloGroupMessage(text);
+  console.log("📨 group/message:", r.status, r.data);
+  if (r.status === 401 || r?.data?.error === -216) {
+    console.log("❌ Token/Permission issue. Kiểm tra lại token/quyền gửi vào nhóm.");
+  }
+  if (r?.data?.error !== 0) {
+    console.log("❌ Zalo send error detail:", r.data);
   }
 }
 
@@ -120,7 +137,7 @@ app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOStri
 
 // ====== WEBHOOK ======
 app.post("/webhook", async (req, res) => {
-  // luôn trả OK sớm cho Zalo
+  // trả OK sớm cho Zalo
   res.status(200).send("OK");
 
   const data = req.body || {};
@@ -327,7 +344,7 @@ if (DAILY_REPORT_ENABLED) {
           (pend.length ? pend.map(t => `• ${render(t)}`).join("\n") : "• Không có");
 
         await sendGroup(msg);
-        // Reset danh sách sau báo cáo ngày (nếu bạn muốn giữ lại, hãy xoá dòng dưới)
+        // Reset danh sách sau báo cáo ngày (nếu muốn giữ lịch sử, hãy bỏ dòng dưới)
         saveTasks([]);
       }
     } catch (e) {
