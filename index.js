@@ -1,4 +1,4 @@
-// index.js — Zalo OA Group Bot (v3) — accept user_send_text & user_send_group_text; assign-only capture; in-progress reply; bc without slash
+// index.js — Zalo OA Group Bot (v3) — robust BC/report for user_send_text; wide group id detection; @assign-only
 import express from "express";
 import bodyParser from "body-parser";
 import axios from "axios";
@@ -10,9 +10,8 @@ dotenv.config();
 
 // ====== ENV ======
 const OA_TOKEN  = process.env.ZALO_OA_ACCESS_TOKEN || process.env.ACCESS_TOKEN || "";
-let   GROUP_ID  = process.env.GROUP_ID || "";
+let   GROUP_ID  = process.env.GROUP_ID || "";   // sẽ tự lưu nếu bắt được từ webhook
 const PORT = Number(process.env.PORT || 3000);
-const TZ = process.env.TZ || "Asia/Bangkok";
 const API_V3 = "https://openapi.zalo.me/v3.0";
 
 // ====== FILES ======
@@ -20,7 +19,7 @@ const TASK_FILE  = "./tasks.json";
 const GROUP_FILE = "./group.json";
 
 // ====== OPTIONS ======
-const AUTO_TODO = true;               // nhưng chỉ ghi khi có @mention
+const AUTO_TODO = true;               // ghi việc, NHƯNG chỉ khi có @mention
 const AUTO_TODO_CONFIRM = false;      // không phản hồi khi ghi việc
 const DAILY_REPORT_ENABLED = true;    // báo cáo tự động 17:00 (VN)
 
@@ -32,10 +31,7 @@ const app = express();
 app.use(bodyParser.json());
 
 // ====== IO HELPERS ======
-function safeRead(path, fallback) {
-  try { return fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, "utf8")) : fallback; }
-  catch { return fallback; }
-}
+function safeRead(path, fallback) { try { return fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, "utf8")) : fallback; } catch { return fallback; } }
 function safeWrite(path, data) { fs.writeFileSync(path, JSON.stringify(data, null, 2)); }
 
 function loadTasks(){ return safeRead(TASK_FILE, []); }
@@ -66,12 +62,9 @@ function extractFirstMentionName(text) {
   if (at === -1) return "";
   const tail = s.slice(at + 1).trim();
   const stops = [
-    tail.indexOf("  "),
-    tail.indexOf("\n"),
-    tail.toLowerCase().indexOf(" buc "),
-    tail.toLowerCase().indexOf(" bục "),
-    tail.toLowerCase().indexOf(" mat "),
-    tail.toLowerCase().indexOf(" mất ")
+    tail.indexOf("  "), tail.indexOf("\n"),
+    tail.toLowerCase().indexOf(" buc "), tail.toLowerCase().indexOf(" bục "),
+    tail.toLowerCase().indexOf(" mat "), tail.toLowerCase().indexOf(" mất ")
   ].filter(i => i >= 0);
   const stopIdx = stops.length ? Math.min(...stops) : -1;
   const name = stopIdx > -1 ? tail.slice(0, stopIdx).trim() : tail;
@@ -80,10 +73,11 @@ function extractFirstMentionName(text) {
 function hasMention(text){ return extractFirstMentionName(text) !== ""; }
 
 // ====== ZALO SEND (v3) — đúng endpoint: oa/group/message ======
-async function zaloGroupMessage(text) {
+async function zaloGroupMessage(text, groupIdOverride) {
+  const gid = groupIdOverride || GROUP_ID;
   return axios.post(
     `${API_V3}/oa/group/message`,
-    { recipient: { group_id: GROUP_ID }, message: { text: String(text) } },
+    { recipient: { group_id: gid }, message: { text: String(text) } },
     {
       headers: {
         "Content-Type": "application/json",
@@ -95,14 +89,13 @@ async function zaloGroupMessage(text) {
     }
   );
 }
-async function sendGroup(text) {
-  if (!GROUP_ID) { console.log("⚠️ No GROUP_ID; cannot send."); return; }
+async function sendGroup(text, groupIdOverride) {
+  const gid = groupIdOverride || GROUP_ID;
+  if (!gid) { console.log("⚠️ No GROUP_ID; cannot send."); return; }
   if (!OA_TOKEN) { console.log("⚠️ Missing ZALO_OA_ACCESS_TOKEN"); return; }
-  const r = await zaloGroupMessage(text);
+  const r = await zaloGroupMessage(text, gid);
   console.log("📨 group/message:", r.status, r.data);
-  if (r.status === 401 || r?.data?.error === -216) {
-    console.log("❌ Token/Permission issue. Kiểm tra lại token/quyền gửi vào nhóm.");
-  }
+  if (r.status === 401 || r?.data?.error === -216) console.log("❌ Token/Permission issue.");
   if (r?.data?.error !== 0) console.log("❌ Zalo send error detail:", r.data);
 }
 
@@ -140,38 +133,29 @@ app.post("/webhook", async (req, res) => {
 
   const data = req.body || {};
 
-  // Nhận group id từ nhiều trường
+  // ——— Bắt group id từ càng nhiều chỗ càng tốt
   const detectedGroupId =
     data?.recipient?.group_id ||
     data?.message?.conversation_id ||
     data?.conversation?.id ||
     data?.message?.group_id ||
+    data?.recipient?.id ||          // một số payload đặt id group ở đây
     "";
-  if (detectedGroupId && !GROUP_ID) saveGroupId(detectedGroupId);
+  if (detectedGroupId && !GROUP_ID) saveGroupId(String(detectedGroupId));
 
-  // Chấp nhận nhiều biến thể event_name
-  const ev = String(data.event_name || "").toLowerCase();
-  // Chỉ xử lý nếu payload thể hiện đây là tin trong group
-  const looksGroup =
-    !!detectedGroupId ||
-    !!data?.recipient?.group_id ||
-    !!data?.message?.conversation_id ||
-    !!data?.message?.group_id ||
-    !!data?.conversation?.id;
-
-  if (!looksGroup) return; // bỏ qua tin nhắn 1:1 với OA
-
-  // Lấy dữ liệu cần thiết
+  // ——— Lấy dữ liệu cơ bản
   const sender      = data?.sender?.id || "";
   const msgId       = data?.message?.msg_id || "";
   const textRaw     = data?.message?.text || "";
   const text        = clean(textRaw);
-  const quote       = data?.message?.quote_msg || {}; // Zalo sẽ gửi nếu reply
+  const quote       = data?.message?.quote_msg || {};
   const quoteText   = clean(quote?.text || "");
   const quoteMsgId  = quote?.msg_id || "";
   const quoteSender = quote?.sender?.id || "";
+  const evName      = String(data?.event_name || "");
+  console.log("🧾 Incoming:", { evName, detectedGroupId, GROUP_ID, text });
 
-  // ====== KHỐI LỆNH (có/không có "/") ======
+  // ====== LỆNH (có/không có “/”) — luôn xử lý, không phụ thuộc event_name ======
   {
     const key = text.toLowerCase().trim().replace(/^[\/\\]+/, "");
     const keyHead = key.split(/\s+/)[0];
@@ -180,8 +164,8 @@ app.post("/webhook", async (req, res) => {
     if (["list","ds"].includes(keyHead)) {
       const tasks = loadTasks();
       const undone = tasks.filter(t => !t.done);
-      if (!undone.length) await sendGroup("📣 Không có việc.");
-      else await sendGroup(`📣 Việc đang mở:\n${undone.slice(-15).map(render).join("\n")}`);
+      if (!undone.length) await sendGroup("📣 Không có việc.", detectedGroupId || undefined);
+      else await sendGroup(`📣 Việc đang mở:\n${undone.slice(-15).map(render).join("\n")}`, detectedGroupId || undefined);
       return;
     }
 
@@ -194,14 +178,11 @@ app.post("/webhook", async (req, res) => {
 
       const msg =
         `🗓️ Báo cáo ${new Date().toLocaleString("vi-VN")}\n\n` +
-        `✅ ĐÃ HOÀN THÀNH:\n` +
-        (done.length ? done.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
-        `⏳ ĐANG XỬ LÝ:\n` +
-        (inprog.length ? inprog.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
-        `⚠️ CHƯA HOÀN THÀNH:\n` +
-        (pend.length ? pend.map(t => `• ${render(t)}`).join("\n") : "• Không có");
+        `✅ ĐÃ HOÀN THÀNH:\n` + (done.length ? done.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
+        `⏳ ĐANG XỬ LÝ:\n` + (inprog.length ? inprog.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
+        `⚠️ CHƯA HOÀN THÀNH:\n` + (pend.length ? pend.map(t => `• ${render(t)}`).join("\n") : "• Không có");
 
-      await sendGroup(msg);
+      await sendGroup(msg, detectedGroupId || undefined);
       return;
     }
 
@@ -210,29 +191,31 @@ app.post("/webhook", async (req, res) => {
       const tasks = loadTasks();
       const filename = `tasks_${Date.now()}.xlsx`;
       exportExcel(tasks, filename);
-      await sendGroup("📄 Đã xuất Excel (file nằm trên server).");
+      await sendGroup("📄 Đã xuất Excel (file nằm trên server).", detectedGroupId || undefined);
       return;
     }
 
     // groupid
     if (["groupid"].includes(keyHead)) {
-      await sendGroup(GROUP_ID ? `GROUP_ID: ${GROUP_ID}` : "Chưa có GROUP_ID.");
+      const gid = detectedGroupId || GROUP_ID;
+      await sendGroup(gid ? `GROUP_ID: ${gid}` : "Chưa có GROUP_ID.", gid || undefined);
       return;
     }
 
     // help / ?
     if (["help","?"].includes(keyHead)) {
-      await sendGroup(`Các lệnh:
+      const help = `Các lệnh:
 - list / ds
 - report / bc / rp
 - export / ex
 - groupid
 - help / ?
-(Chỉ ghi nhận công việc mới khi tin có @Tên)`);
+(Chỉ ghi nhận công việc mới khi tin có @Tên; reply không có “ok/đã xử lý…” => ⏳ đang xử lý)`;
+      await sendGroup(help, detectedGroupId || undefined);
       return;
     }
   }
-  // ====== HẾT KHỐI LỆNH ======
+  // ====== HẾT LỆNH ======
 
   // ====== GHI VIỆC MỚI — CHỈ khi có @mention ======
   if (AUTO_TODO && hasMention(text)) {
@@ -254,11 +237,9 @@ app.post("/webhook", async (req, res) => {
         src_sender: sender
       };
       tasks.push(t); saveTasks(tasks);
-      console.log("📝 ASSIGN captured (@mention):", { id: t.id, owner_uid: t.owner_uid, owner_name: t.owner_name, message: t.message });
-      if (AUTO_TODO_CONFIRM) await sendGroup(`📝 Đã ghi nhận việc: #${t.id} ${t.message}`);
+      console.log("📝 ASSIGN captured (@mention):", { id: t.id, owner: t.owner_name || t.owner_uid });
+      if (AUTO_TODO_CONFIRM) await sendGroup(`📝 Đã ghi nhận việc: #${t.id} ${t.message}`, detectedGroupId || undefined);
     }
-  } else {
-    // Không @ => không ghi nhận
   }
 
   // ====== ĐÁNH DẤU HOÀN THÀNH ======
@@ -297,7 +278,7 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
-  // ====== REPLY không có từ khóa hoàn thành -> set ĐANG XỬ LÝ (chỉ khi task đã tồn tại) ======
+  // ====== REPLY KHÔNG có từ khóa hoàn thành -> set ĐANG XỬ LÝ (chỉ khi task đã tồn tại) ======
   if (quoteMsgId && !DONE_REGEX.test(text)) {
     const tasks = loadTasks();
     const t = tasks.find(x => x.src_msg_id === quoteMsgId);
@@ -306,7 +287,7 @@ app.post("/webhook", async (req, res) => {
       if (!t.owner_name) t.owner_name = extractFirstMentionName(t.message) || "";
       t.inProgress = true;
       saveTasks(tasks);
-      await sendGroup(`⏳ Việc #${t.id} đang chờ xử lý.`);
+      await sendGroup(`⏳ Việc #${t.id} đang chờ xử lý.`, detectedGroupId || undefined);
     } else {
       console.log("ℹ️ InProgress reply ignored: no matched task.");
     }
@@ -329,20 +310,15 @@ if (DAILY_REPORT_ENABLED) {
 
         const msg =
           `🗓️ Báo cáo ngày ${now.toLocaleDateString("vi-VN")}\n\n` +
-          `✅ ĐÃ HOÀN THÀNH:\n` +
-          (done.length ? done.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
-          `⏳ ĐANG XỬ LÝ:\n` +
-          (inprog.length ? inprog.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
-          `⚠️ CHƯA HOÀN THÀNH:\n` +
-          (pend.length ? pend.map(t => `• ${render(t)}`).join("\n") : "• Không có");
+          `✅ ĐÃ HOÀN THÀNH:\n` + (done.length ? done.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
+          `⏳ ĐANG XỬ LÝ:\n` + (inprog.length ? inprog.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
+          `⚠️ CHƯA HOÀN THÀNH:\n` + (pend.length ? pend.map(t => `• ${render(t)}`).join("\n") : "• Không có");
 
         await sendGroup(msg);
-        // Nếu muốn giữ lịch sử, hãy comment dòng dưới:
+        // Muốn giữ lịch sử thì comment dòng dưới:
         saveTasks([]);
       }
-    } catch (e) {
-      console.log("⏰ daily report err:", e.message);
-    }
+    } catch (e) { console.log("⏰ daily report err:", e.message); }
   }, 60 * 1000);
 }
 
