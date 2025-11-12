@@ -1,4 +1,4 @@
-// index.js — Zalo OA Group Bot (v3) — Assign-only capture (@mention), In-Progress on reply, No normal capture
+// index.js — Zalo OA Group Bot (v3) — accept user_send_text & user_send_group_text; assign-only capture; in-progress reply; bc without slash
 import express from "express";
 import bodyParser from "body-parser";
 import axios from "axios";
@@ -20,11 +20,11 @@ const TASK_FILE  = "./tasks.json";
 const GROUP_FILE = "./group.json";
 
 // ====== OPTIONS ======
-const AUTO_TODO = true;               // bật cơ chế ghi việc, NHƯNG chỉ khi có @mention
+const AUTO_TODO = true;               // nhưng chỉ ghi khi có @mention
 const AUTO_TODO_CONFIRM = false;      // không phản hồi khi ghi việc
 const DAILY_REPORT_ENABLED = true;    // báo cáo tự động 17:00 (VN)
 
-// DONE keywords (đánh dấu hoàn thành)
+// DONE keywords
 const DONE_REGEX = /(đã xong|da xong|\bok\b|okay|xong\b|hoàn thành|hoan thanh|đã xử lý|da xu ly|ok đã xử lý)/i;
 
 // ====== APP ======
@@ -136,31 +136,42 @@ app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOStri
 
 // ====== WEBHOOK ======
 app.post("/webhook", async (req, res) => {
-  // trả OK sớm cho Zalo
   res.status(200).send("OK");
 
   const data = req.body || {};
 
-  // Lưu group id nếu payload có
+  // Nhận group id từ nhiều trường
   const detectedGroupId =
     data?.recipient?.group_id ||
     data?.message?.conversation_id ||
-    data?.conversation?.id || "";
+    data?.conversation?.id ||
+    data?.message?.group_id ||
+    "";
   if (detectedGroupId && !GROUP_ID) saveGroupId(detectedGroupId);
 
-  // Chỉ xử lý event text trong nhóm
-  if (data.event_name !== "user_send_group_text") return;
+  // Chấp nhận nhiều biến thể event_name
+  const ev = String(data.event_name || "").toLowerCase();
+  // Chỉ xử lý nếu payload thể hiện đây là tin trong group
+  const looksGroup =
+    !!detectedGroupId ||
+    !!data?.recipient?.group_id ||
+    !!data?.message?.conversation_id ||
+    !!data?.message?.group_id ||
+    !!data?.conversation?.id;
 
+  if (!looksGroup) return; // bỏ qua tin nhắn 1:1 với OA
+
+  // Lấy dữ liệu cần thiết
   const sender      = data?.sender?.id || "";
   const msgId       = data?.message?.msg_id || "";
   const textRaw     = data?.message?.text || "";
   const text        = clean(textRaw);
-  const quote       = data?.message?.quote_msg || {};
+  const quote       = data?.message?.quote_msg || {}; // Zalo sẽ gửi nếu reply
   const quoteText   = clean(quote?.text || "");
   const quoteMsgId  = quote?.msg_id || "";
   const quoteSender = quote?.sender?.id || "";
 
-  // ====== KHỐI LỆNH (có hoặc không có dấu /) ======
+  // ====== KHỐI LỆNH (có/không có "/") ======
   {
     const key = text.toLowerCase().trim().replace(/^[\/\\]+/, "");
     const keyHead = key.split(/\s+/)[0];
@@ -170,7 +181,7 @@ app.post("/webhook", async (req, res) => {
       const tasks = loadTasks();
       const undone = tasks.filter(t => !t.done);
       if (!undone.length) await sendGroup("📣 Không có việc.");
-      else await sendGroup(`📣 Việc đang mở:\n${undone.slice(-10).map(render).join("\n")}`);
+      else await sendGroup(`📣 Việc đang mở:\n${undone.slice(-15).map(render).join("\n")}`);
       return;
     }
 
@@ -231,14 +242,14 @@ app.post("/webhook", async (req, res) => {
       const t = {
         id: nextTaskId(tasks),
         sender,
-        owner_uid: sender,                             // mặc định chủ trì = người giao
-        owner_name: extractFirstMentionName(content) || "", // tên được giao từ @mention
+        owner_uid: sender,                             // người giao
+        owner_name: extractFirstMentionName(content) || "", // người được giao (@Tên)
         message: content,
         dueAt: null,
         createdAt: new Date().toISOString(),
         done: false,
         doneAt: null,
-        inProgress: false,         // trạng thái ban đầu
+        inProgress: false,
         src_msg_id: msgId || "",
         src_sender: sender
       };
@@ -247,22 +258,17 @@ app.post("/webhook", async (req, res) => {
       if (AUTO_TODO_CONFIRM) await sendGroup(`📝 Đã ghi nhận việc: #${t.id} ${t.message}`);
     }
   } else {
-    // Không có @mention -> KHÔNG ghi việc (đúng yêu cầu)
-    // console.log("ℹ️ Skip capture: no @mention.");
+    // Không @ => không ghi nhận
   }
 
-  // ====== ĐÁNH DẤU HOÀN THÀNH (ok/đã xử lý/...) ======
+  // ====== ĐÁNH DẤU HOÀN THÀNH ======
   if (DONE_REGEX.test(text)) {
     const tasks = loadTasks();
 
-    // a) reply vào tin gốc -> tìm theo src_msg_id (CHỈ cập nhật, KHÔNG tự tạo mới)
+    // a) reply vào tin gốc -> tìm theo src_msg_id (không auto-create)
     if (quoteMsgId) {
       const t = tasks.find(x => x.src_msg_id === quoteMsgId);
-      if (!t) { 
-        // Không tạo task mới để giữ quy tắc "không @ thì không ghi nhận"
-        console.log("ℹ️ DONE reply ignored: no matched task (no auto-create).");
-        return; 
-      }
+      if (!t) { console.log("ℹ️ DONE reply ignored: no matched task."); return; }
       if (!t.owner_uid)  t.owner_uid = quoteSender || sender || "";
       if (!t.owner_name) t.owner_name = extractFirstMentionName(t.message) || "";
       t.done = true;
@@ -273,7 +279,7 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // b) không reply -> lấy việc mở gần nhất của người này (nếu có)
+    // b) không reply -> close việc mở gần nhất của người này (nếu có)
     const tasks2 = loadTasks();
     for (let i = tasks2.length - 1; i >= 0; i--) {
       const t = tasks2[i];
@@ -291,7 +297,7 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
-  // ====== REPLY KHÔNG có từ khóa hoàn thành -> đánh dấu ĐANG XỬ LÝ (CHỈ khi task đã tồn tại) ======
+  // ====== REPLY không có từ khóa hoàn thành -> set ĐANG XỬ LÝ (chỉ khi task đã tồn tại) ======
   if (quoteMsgId && !DONE_REGEX.test(text)) {
     const tasks = loadTasks();
     const t = tasks.find(x => x.src_msg_id === quoteMsgId);
@@ -302,8 +308,7 @@ app.post("/webhook", async (req, res) => {
       saveTasks(tasks);
       await sendGroup(`⏳ Việc #${t.id} đang chờ xử lý.`);
     } else {
-      // Không tạo task mới nếu chưa từng giao bằng @
-      console.log("ℹ️ InProgress reply ignored: no matched task (no auto-create).");
+      console.log("ℹ️ InProgress reply ignored: no matched task.");
     }
     return;
   }
@@ -332,7 +337,7 @@ if (DAILY_REPORT_ENABLED) {
           (pend.length ? pend.map(t => `• ${render(t)}`).join("\n") : "• Không có");
 
         await sendGroup(msg);
-        // Nếu bạn muốn giữ lịch sử, hãy comment dòng dưới:
+        // Nếu muốn giữ lịch sử, hãy comment dòng dưới:
         saveTasks([]);
       }
     } catch (e) {
