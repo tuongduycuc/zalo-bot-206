@@ -1,4 +1,7 @@
-// index.js — Zalo OA Group Bot (v3) — robust BC/report for user_send_text; wide group id detection; @assign-only
+// index.js — Zalo OA Group Bot (v3) — stable BC/report + @assign-only + robust group-id
+// ✅ Ẩn "ok/đã xử lý..." khi hiển thị
+// ✅ @mention + "ok/đã xử lý" => không tạo việc mới, coi là DONE việc mở gần nhất
+
 import express from "express";
 import bodyParser from "body-parser";
 import axios from "axios";
@@ -10,7 +13,7 @@ dotenv.config();
 
 // ====== ENV ======
 const OA_TOKEN  = process.env.ZALO_OA_ACCESS_TOKEN || process.env.ACCESS_TOKEN || "";
-let   GROUP_ID  = process.env.GROUP_ID || "";   // sẽ tự lưu nếu bắt được từ webhook
+let   GROUP_ID  = process.env.GROUP_ID || "";   // sẽ tự lưu khi bắt được từ webhook
 const PORT = Number(process.env.PORT || 3000);
 const API_V3 = "https://openapi.zalo.me/v3.0";
 
@@ -19,12 +22,12 @@ const TASK_FILE  = "./tasks.json";
 const GROUP_FILE = "./group.json";
 
 // ====== OPTIONS ======
-const AUTO_TODO = true;               // ghi việc, NHƯNG chỉ khi có @mention
-const AUTO_TODO_CONFIRM = false;      // không phản hồi khi ghi việc
-const DAILY_REPORT_ENABLED = true;    // báo cáo tự động 17:00 (VN)
+const AUTO_TODO = true;               // ghi việc (chỉ khi có @mention)
+const AUTO_TODO_CONFIRM = false;      // không trả lời xác nhận tạo việc
+const DAILY_REPORT_ENABLED = true;    // báo cáo tự động 17:00 (giờ VN)
 
-// DONE keywords
-const DONE_REGEX = /(đã xong|da xong|\bok\b|okay|xong\b|hoàn thành|hoan thanh|đã xử lý|da xu ly|ok đã xử lý)/i;
+// Từ khóa hoàn thành
+const DONE_REGEX = /(đã xong|da xong|\bok\b|okay|xong\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
 
 // ====== APP ======
 const app = express();
@@ -51,11 +54,22 @@ if (!GROUP_ID) GROUP_ID = loadGroupId();
 
 // ====== TEXT HELPERS ======
 function clean(s){ return String(s||"").trim(); }
+
+// Bỏ “ok/đã xử lý…” ở cuối nội dung để hiển thị đẹp
+function prettyMessage(msg) {
+  if (!msg) return "";
+  let s = String(msg);
+  s = s.replace(/\s*(đã xong|da xong|\bok\b|okay|xong\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)\s*$/i, "");
+  return s.trim();
+}
+
 function render(t){
   const flag = t.done ? "✅" : (t.inProgress ? "⏳" : "⚠️");
   const who  = t.owner_name || t.owner_uid || "—";
-  return `${flag} #${t.id} • ${t.message}  👤 ${who}`;
+  const msg  = prettyMessage(t.message);
+  return `${flag} #${t.id} • ${msg}  👤 ${who}`;
 }
+
 function extractFirstMentionName(text) {
   const s = String(text || "");
   const at = s.indexOf("@");
@@ -63,8 +77,10 @@ function extractFirstMentionName(text) {
   const tail = s.slice(at + 1).trim();
   const stops = [
     tail.indexOf("  "), tail.indexOf("\n"),
-    tail.toLowerCase().indexOf(" buc "), tail.toLowerCase().indexOf(" bục "),
-    tail.toLowerCase().indexOf(" mat "), tail.toLowerCase().indexOf(" mất ")
+    tail.toLowerCase().indexOf(" buc "),
+    tail.toLowerCase().indexOf(" bục "),
+    tail.toLowerCase().indexOf(" mat "),
+    tail.toLowerCase().indexOf(" mất ")
   ].filter(i => i >= 0);
   const stopIdx = stops.length ? Math.min(...stops) : -1;
   const name = stopIdx > -1 ? tail.slice(0, stopIdx).trim() : tail;
@@ -72,7 +88,7 @@ function extractFirstMentionName(text) {
 }
 function hasMention(text){ return extractFirstMentionName(text) !== ""; }
 
-// ====== ZALO SEND (v3) — đúng endpoint: oa/group/message ======
+// ====== ZALO SEND (v3) — endpoint oa/group/message ======
 async function zaloGroupMessage(text, groupIdOverride) {
   const gid = groupIdOverride || GROUP_ID;
   return axios.post(
@@ -133,17 +149,17 @@ app.post("/webhook", async (req, res) => {
 
   const data = req.body || {};
 
-  // ——— Bắt group id từ càng nhiều chỗ càng tốt
+  // —— Bắt group id từ nhiều chỗ
   const detectedGroupId =
     data?.recipient?.group_id ||
     data?.message?.conversation_id ||
     data?.conversation?.id ||
     data?.message?.group_id ||
-    data?.recipient?.id ||          // một số payload đặt id group ở đây
+    data?.recipient?.id ||
     "";
   if (detectedGroupId && !GROUP_ID) saveGroupId(String(detectedGroupId));
 
-  // ——— Lấy dữ liệu cơ bản
+  // —— Lấy dữ liệu cơ bản
   const sender      = data?.sender?.id || "";
   const msgId       = data?.message?.msg_id || "";
   const textRaw     = data?.message?.text || "";
@@ -155,12 +171,31 @@ app.post("/webhook", async (req, res) => {
   const evName      = String(data?.event_name || "");
   console.log("🧾 Incoming:", { evName, detectedGroupId, GROUP_ID, text });
 
-  // ====== LỆNH (có/không có “/”) — luôn xử lý, không phụ thuộc event_name ======
+  // ====== TRÁNH TẠO TASK MỚI khi tin có cả @mention và từ khóa DONE ======
+  const bothMentionAndDone = hasMention(text) && DONE_REGEX.test(text);
+  if (bothMentionAndDone) {
+    const tasks = loadTasks();
+    for (let i = tasks.length - 1; i >= 0; i--) {
+      const t = tasks[i];
+      if (!t.done && (t.sender === sender || !t.owner_uid)) {
+        t.done = true;
+        t.doneAt = new Date().toISOString();
+        t.inProgress = false;
+        if (!t.owner_uid)  t.owner_uid = sender || "";
+        if (!t.owner_name) t.owner_name = extractFirstMentionName(t.message) || "";
+        saveTasks(tasks);
+        console.log("✅ DONE-by-mixed(@+ok):", t.id);
+        break;
+      }
+    }
+    return;
+  }
+
+  // ====== LỆNH — luôn xử lý (không phụ thuộc event_name) ======
   {
     const key = text.toLowerCase().trim().replace(/^[\/\\]+/, "");
     const keyHead = key.split(/\s+/)[0];
 
-    // list / ds
     if (["list","ds"].includes(keyHead)) {
       const tasks = loadTasks();
       const undone = tasks.filter(t => !t.done);
@@ -169,7 +204,6 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // report / bc / rp
     if (["report","bc","rp"].includes(keyHead)) {
       const tasks  = loadTasks();
       const done   = tasks.filter(t => t.done);
@@ -186,7 +220,6 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // export / ex
     if (["export","ex"].includes(keyHead)) {
       const tasks = loadTasks();
       const filename = `tasks_${Date.now()}.xlsx`;
@@ -195,14 +228,12 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // groupid
     if (["groupid"].includes(keyHead)) {
       const gid = detectedGroupId || GROUP_ID;
       await sendGroup(gid ? `GROUP_ID: ${gid}` : "Chưa có GROUP_ID.", gid || undefined);
       return;
     }
 
-    // help / ?
     if (["help","?"].includes(keyHead)) {
       const help = `Các lệnh:
 - list / ds
@@ -210,7 +241,7 @@ app.post("/webhook", async (req, res) => {
 - export / ex
 - groupid
 - help / ?
-(Chỉ ghi nhận công việc mới khi tin có @Tên; reply không có “ok/đã xử lý…” => ⏳ đang xử lý)`;
+(Chỉ ghi nhận việc mới khi tin có @Tên; reply không có “ok/đã xử lý…” => ⏳ đang xử lý)`;
       await sendGroup(help, detectedGroupId || undefined);
       return;
     }
@@ -225,8 +256,8 @@ app.post("/webhook", async (req, res) => {
       const t = {
         id: nextTaskId(tasks),
         sender,
-        owner_uid: sender,                             // người giao
-        owner_name: extractFirstMentionName(content) || "", // người được giao (@Tên)
+        owner_uid: sender,
+        owner_name: extractFirstMentionName(content) || "",
         message: content,
         dueAt: null,
         createdAt: new Date().toISOString(),
@@ -237,8 +268,8 @@ app.post("/webhook", async (req, res) => {
         src_sender: sender
       };
       tasks.push(t); saveTasks(tasks);
-      console.log("📝 ASSIGN captured (@mention):", { id: t.id, owner: t.owner_name || t.owner_uid });
-      if (AUTO_TODO_CONFIRM) await sendGroup(`📝 Đã ghi nhận việc: #${t.id} ${t.message}`, detectedGroupId || undefined);
+      console.log("📝 ASSIGN (@mention):", { id: t.id, owner: t.owner_name || t.owner_uid });
+      if (AUTO_TODO_CONFIRM) await sendGroup(`📝 Đã ghi nhận việc: #${t.id} ${prettyMessage(t.message)}`, detectedGroupId || undefined);
     }
   }
 
@@ -278,7 +309,7 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
-  // ====== REPLY KHÔNG có từ khóa hoàn thành -> set ĐANG XỬ LÝ (chỉ khi task đã tồn tại) ======
+  // ====== REPLY KHÔNG có từ khóa hoàn thành -> set ĐANG XỬ LÝ (nếu đã có task) ======
   if (quoteMsgId && !DONE_REGEX.test(text)) {
     const tasks = loadTasks();
     const t = tasks.find(x => x.src_msg_id === quoteMsgId);
