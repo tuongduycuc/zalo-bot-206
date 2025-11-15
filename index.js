@@ -1,6 +1,11 @@
-// index.js — Zalo OA Group Bot (v3) — stable BC/report + @assign-only + robust group-id
-// ✅ Ẩn "ok/đã xử lý..." khi hiển thị
-// ✅ @mention + "ok/đã xử lý" => không tạo việc mới, coi là DONE việc mở gần nhất
+// index.js — Zalo OA Group Bot (v3) — stable
+// ✅ Chỉ ghi nhận việc khi tin nhắn có @Tên
+// ✅ Nếu tin có cả @mention + "ok/đã xử lý..." => không tạo việc mới, mà đánh dấu DONE cho việc mở gần nhất
+// ✅ Reply KHÔNG có từ khóa hoàn thành => set "ĐANG XỬ LÝ"
+// ✅ Ẩn "ok/đã xử lý..." khi hiển thị nội dung
+// ✅ Báo cáo tay: list / report / bc / rp
+// ✅ Báo cáo tự động 17:00 giờ VN (giữ nguyên dữ liệu hoặc xóa sau báo cáo tùy chỉnh)
+// ✅ Xuất Excel: export / ex
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -13,7 +18,7 @@ dotenv.config();
 
 // ====== ENV ======
 const OA_TOKEN  = process.env.ZALO_OA_ACCESS_TOKEN || process.env.ACCESS_TOKEN || "";
-let   GROUP_ID  = process.env.GROUP_ID || "";   // sẽ tự lưu khi bắt được từ webhook
+let   GROUP_ID  = process.env.GROUP_ID || "";
 const PORT = Number(process.env.PORT || 3000);
 const API_V3 = "https://openapi.zalo.me/v3.0";
 
@@ -23,8 +28,8 @@ const GROUP_FILE = "./group.json";
 
 // ====== OPTIONS ======
 const AUTO_TODO = true;               // ghi việc (chỉ khi có @mention)
-const AUTO_TODO_CONFIRM = false;      // không trả lời xác nhận tạo việc
-const DAILY_REPORT_ENABLED = true;    // báo cáo tự động 17:00 (giờ VN)
+const AUTO_TODO_CONFIRM = false;      // không gửi tin xác nhận “đã tạo việc”
+const DAILY_REPORT_ENABLED = true;    // báo cáo tự động 17:00 giờ VN (UTC+7)
 
 // Từ khóa hoàn thành
 const DONE_REGEX = /(đã xong|da xong|\bok\b|okay|xong\b|hoàn thành|hoan thanh|đã xử lý|da xu ly)/i;
@@ -149,7 +154,7 @@ app.post("/webhook", async (req, res) => {
 
   const data = req.body || {};
 
-  // —— Bắt group id từ nhiều chỗ
+  // —— Bắt GROUP_ID từ nhiều chỗ
   const detectedGroupId =
     data?.recipient?.group_id ||
     data?.message?.conversation_id ||
@@ -171,7 +176,7 @@ app.post("/webhook", async (req, res) => {
   const evName      = String(data?.event_name || "");
   console.log("🧾 Incoming:", { evName, detectedGroupId, GROUP_ID, text });
 
-  // ====== TRÁNH TẠO TASK MỚI khi tin có cả @mention và từ khóa DONE ======
+  // ====== KHÔNG tạo task nếu có cả @mention & DONE trong cùng tin ======
   const bothMentionAndDone = hasMention(text) && DONE_REGEX.test(text);
   if (bothMentionAndDone) {
     const tasks = loadTasks();
@@ -191,62 +196,59 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
-  // ====== LỆNH — luôn xử lý (không phụ thuộc event_name) ======
-  {
-    const key = text.toLowerCase().trim().replace(/^[\/\\]+/, "");
-    const keyHead = key.split(/\s+/)[0];
+  // ====== LỆNH ======
+  const key = text.toLowerCase().trim().replace(/^[\/\\]+/, "");
+  const keyHead = key.split(/\s+/)[0];
 
-    if (["list","ds"].includes(keyHead)) {
-      const tasks = loadTasks();
-      const undone = tasks.filter(t => !t.done);
-      if (!undone.length) await sendGroup("📣 Không có việc.", detectedGroupId || undefined);
-      else await sendGroup(`📣 Việc đang mở:\n${undone.slice(-15).map(render).join("\n")}`, detectedGroupId || undefined);
-      return;
-    }
+  if (["list","ds"].includes(keyHead)) {
+    const tasks = loadTasks();
+    const undone = tasks.filter(t => !t.done);
+    if (!undone.length) await sendGroup("📣 Không có việc.", detectedGroupId || undefined);
+    else await sendGroup(`📣 Việc đang mở:\n${undone.slice(-15).map(render).join("\n")}`, detectedGroupId || undefined);
+    return;
+  }
 
-    if (["report","bc","rp"].includes(keyHead)) {
-      const tasks  = loadTasks();
-      const done   = tasks.filter(t => t.done);
-      const inprog = tasks.filter(t => !t.done && t.inProgress);
-      const pend   = tasks.filter(t => !t.done && !t.inProgress);
+  if (["report","bc","rp"].includes(keyHead)) {
+    const tasks  = loadTasks();
+    const done   = tasks.filter(t => t.done);
+    const inprog = tasks.filter(t => !t.done && t.inProgress);
+    const pend   = tasks.filter(t => !t.done && !t.inProgress);
 
-      const msg =
-        `🗓️ Báo cáo ${new Date().toLocaleString("vi-VN")}\n\n` +
-        `✅ ĐÃ HOÀN THÀNH:\n` + (done.length ? done.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
-        `⏳ ĐANG XỬ LÝ:\n` + (inprog.length ? inprog.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
-        `⚠️ CHƯA HOÀN THÀNH:\n` + (pend.length ? pend.map(t => `• ${render(t)}`).join("\n") : "• Không có");
+    const msg =
+      `🗓️ Báo cáo ${new Date().toLocaleString("vi-VN")}\n\n` +
+      `✅ ĐÃ HOÀN THÀNH:\n` + (done.length ? done.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
+      `⏳ ĐANG XỬ LÝ:\n` + (inprog.length ? inprog.map(t => `• ${render(t)}`).join("\n") : "• Không có") + "\n\n" +
+      `⚠️ CHƯA HOÀN THÀNH:\n` + (pend.length ? pend.map(t => `• ${render(t)}`).join("\n") : "• Không có");
 
-      await sendGroup(msg, detectedGroupId || undefined);
-      return;
-    }
+    await sendGroup(msg, detectedGroupId || undefined);
+    return;
+  }
 
-    if (["export","ex"].includes(keyHead)) {
-      const tasks = loadTasks();
-      const filename = `tasks_${Date.now()}.xlsx`;
-      exportExcel(tasks, filename);
-      await sendGroup("📄 Đã xuất Excel (file nằm trên server).", detectedGroupId || undefined);
-      return;
-    }
+  if (["export","ex"].includes(keyHead)) {
+    const tasks = loadTasks();
+    const filename = `tasks_${Date.now()}.xlsx`;
+    exportExcel(tasks, filename);
+    await sendGroup("📄 Đã xuất Excel (file nằm trên server).", detectedGroupId || undefined);
+    return;
+  }
 
-    if (["groupid"].includes(keyHead)) {
-      const gid = detectedGroupId || GROUP_ID;
-      await sendGroup(gid ? `GROUP_ID: ${gid}` : "Chưa có GROUP_ID.", gid || undefined);
-      return;
-    }
+  if (["groupid"].includes(keyHead)) {
+    const gid = detectedGroupId || GROUP_ID;
+    await sendGroup(gid ? `GROUP_ID: ${gid}` : "Chưa có GROUP_ID.", gid || undefined);
+    return;
+  }
 
-    if (["help","?"].includes(keyHead)) {
-      const help = `Các lệnh:
+  if (["help","?"].includes(keyHead)) {
+    const help = `Các lệnh:
 - list / ds
 - report / bc / rp
 - export / ex
 - groupid
 - help / ?
 (Chỉ ghi nhận việc mới khi tin có @Tên; reply không có “ok/đã xử lý…” => ⏳ đang xử lý)`;
-      await sendGroup(help, detectedGroupId || undefined);
-      return;
-    }
+    await sendGroup(help, detectedGroupId || undefined);
+    return;
   }
-  // ====== HẾT LỆNH ======
 
   // ====== GHI VIỆC MỚI — CHỈ khi có @mention ======
   if (AUTO_TODO && hasMention(text)) {
@@ -277,7 +279,7 @@ app.post("/webhook", async (req, res) => {
   if (DONE_REGEX.test(text)) {
     const tasks = loadTasks();
 
-    // a) reply vào tin gốc -> tìm theo src_msg_id (không auto-create)
+    // a) reply vào tin gốc -> tìm theo src_msg_id
     if (quoteMsgId) {
       const t = tasks.find(x => x.src_msg_id === quoteMsgId);
       if (!t) { console.log("ℹ️ DONE reply ignored: no matched task."); return; }
@@ -347,7 +349,7 @@ if (DAILY_REPORT_ENABLED) {
 
         await sendGroup(msg);
         // Muốn giữ lịch sử thì comment dòng dưới:
-        saveTasks([]);
+        // saveTasks([]);
       }
     } catch (e) { console.log("⏰ daily report err:", e.message); }
   }, 60 * 1000);
